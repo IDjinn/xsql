@@ -1,0 +1,29 @@
+; xsql demo — run from the repo root:
+;   cargo run -- examples/demo.xsql
+USE xsql-tests/fixtures/database.local.xml
+
+; strip science attributes from every arm
+FOREACH arm IN arms
+    DELETE IGNORE arm.unlock_civi_science
+    DELETE IGNORE arm.science
+;
+
+; swap the whole group for new data
+REPLACE GROUP new_continued_cost
+RAW XML `
+<ItemSpec id="52034301" level="1" cost="500" rewardMin="0" rewardMax="500"/>
+<ItemSpec id="52034302" level="2" cost="1000" rewardMin="501" rewardMax="1000"/>
+`;
+
+; print the goods above a threshold (query only, does not modify)
+SELECT GROUP goods
+FOREACH good IN goods
+    WHERE goods.id > 52034301
+;
+
+; rename exactly one office
+FOREACH office IN office
+    WHERE office.id = 216000
+    SET office.name = "New Office Name"
+    BREAK;
+;

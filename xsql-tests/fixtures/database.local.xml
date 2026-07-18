@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<database>
+    <arms>
+        <ItemSpec id="101" cost="500" science="1" unlock_civi_science="2"/>
+        <ItemSpec id="102" cost="900" science="3" unlock_civi_science="4"/>
+        <ItemSpec id="103" cost="1200" unlock_civi_science="5"/>
+    </arms>
+    <goods>
+        <ItemSpec id="52034301" level="1" cost="500"/>
+        <ItemSpec id="52034302" level="2" cost="1000"/>
+        <ItemSpec id="52034307" level="7" cost="4000"/>
+    </goods>
+    <new_continued_cost>
+        <ItemSpec id="1" level="1" cost="1"/>
+    </new_continued_cost>
+    <office>
+        <OfficeSpec id="216000" name="Old Office"/>
+        <OfficeSpec id="216001" name="Other Office"/>
+    </office>
+</database>

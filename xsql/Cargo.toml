@@ -1,0 +1,10 @@
+[package]
+name = "xsql"
+version = "0.1.0"
+edition = "2024"
+description = "SQL-like language for querying and mutating XML files"
+license = "MIT"
+
+[dependencies]
+quick-xml = "0.37"
+rayon = "1.10"
