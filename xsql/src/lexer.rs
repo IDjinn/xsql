@@ -50,6 +50,7 @@ pub enum Tok {
     And,
     Or,
     Not,
+    Analyze,
 
     Eof,
 }
@@ -247,6 +248,7 @@ impl<'a> Lexer<'a> {
             "AND" => Tok::And,
             "OR" => Tok::Or,
             "NOT" => Tok::Not,
+            "ANALYZE" => Tok::Analyze,
             _ => Tok::Ident(word),
         }
     }

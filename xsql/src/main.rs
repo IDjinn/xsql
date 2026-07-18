@@ -83,8 +83,9 @@ fn main() -> ExitCode {
         }
     };
 
-    let script = match parser::parse(&source) {
-        Ok(script) => script,
+    let total_start = std::time::Instant::now();
+    let (script, parse_times) = match parser::parse_with_times(&source) {
+        Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("{}", e.render(&source_name, &source));
             return ExitCode::FAILURE;
@@ -92,6 +93,7 @@ fn main() -> ExitCode {
     };
 
     let uses_input = script.blocks.iter().any(|b| b.source == Source::Input);
+    let stdin_start = std::time::Instant::now();
     let stdin_xml = if uses_input && !script_from_stdin {
         match read_stdin() {
             Ok(xml) => Some(xml),
@@ -103,10 +105,29 @@ fn main() -> ExitCode {
     } else {
         None
     };
+    let stdin_time = stdin_start.elapsed();
+    let read_stdin_xml = stdin_xml.is_some();
 
-    match eval::run(&script, stdin_xml) {
-        Ok(output) => {
-            print!("{output}");
+    match eval::run_with_report(&script, stdin_xml) {
+        Ok((output, report)) => {
+            match report {
+                Some(mut report) => {
+                    let mut pre = vec![
+                        ("lex".to_string(), parse_times.lex),
+                        ("parse".to_string(), parse_times.parse),
+                    ];
+                    if read_stdin_xml {
+                        pre.push(("read stdin".to_string(), stdin_time));
+                    }
+                    report.prepend(pre);
+                    let write_start = std::time::Instant::now();
+                    print!("{output}");
+                    let _ = std::io::stdout().flush();
+                    report.push("write stdout", write_start.elapsed());
+                    eprint!("{}", report.render(total_start.elapsed()));
+                }
+                None => print!("{output}"),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

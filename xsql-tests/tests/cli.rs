@@ -104,6 +104,27 @@ fn runtime_error_sets_exit_code_and_span() {
     assert!(out.stderr.contains("--> <eval>:2:"));
 }
 
+/// ANALYZE report lands on stderr; stdout stays a clean XML stream.
+#[test]
+fn analyze_report_goes_to_stderr() {
+    let xml = r#"<db><arms><ItemSpec id="7"/></arms></db>"#;
+    let out = run_xsql(
+        &["-e", "ANALYZE;\nUSE INPUT SELECT GROUP arms;"],
+        Some(xml),
+        None,
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains(r#"<ItemSpec id="7"/>"#));
+    assert!(!out.stdout.contains("ANALYZE"), "{}", out.stdout);
+    assert!(out.stderr.contains("-- ANALYZE"), "{}", out.stderr);
+    assert!(out.stderr.contains("lex"), "{}", out.stderr);
+    assert!(out.stderr.contains("parse"), "{}", out.stderr);
+    assert!(out.stderr.contains("read stdin"), "{}", out.stderr);
+    assert!(out.stderr.contains("write stdout"), "{}", out.stderr);
+    assert!(out.stderr.contains("memory (documents)"), "{}", out.stderr);
+    assert!(out.stderr.contains("total"), "{}", out.stderr);
+}
+
 #[test]
 fn usage_error_exit_code() {
     let out = run_xsql(&["--bogus"], None, None);

@@ -1,4 +1,4 @@
-use xsql::ast::{Op, Source, Verb};
+use xsql::ast::{Op, Setting, Settings, Source, Verb};
 use xsql::parser::parse;
 
 /// The four scripts from the original scratch file must parse verbatim.
@@ -125,6 +125,46 @@ fn parse_error_reports_span() {
     let err = parse("USE db.xml\nSELECT arms;").unwrap_err();
     assert!(err.message.contains("expected `GROUP`"), "{}", err.message);
     assert_eq!(err.span.unwrap().line, 2);
+}
+
+#[test]
+fn global_set_and_analyze_statements() {
+    let script = parse(
+        "SET format = OFF;\nANALYZE;\nSET IGNORE_COMMENTS = off;\nUSE db.xml SELECT GROUP arms;",
+    )
+    .unwrap();
+    assert_eq!(script.blocks.len(), 1);
+    assert_eq!(script.settings.len(), 3);
+    assert!(matches!(script.settings[0].setting, Setting::Format));
+    assert!(!script.settings[0].value);
+    assert!(matches!(script.settings[1].setting, Setting::Analyze));
+    assert!(script.settings[1].value);
+    assert!(matches!(script.settings[2].setting, Setting::IgnoreComments));
+    assert!(!script.settings[2].value);
+
+    let settings = Settings::resolve(&script.settings);
+    assert!(!settings.format);
+    assert!(!settings.ignore_comments);
+    assert!(settings.analyze);
+}
+
+#[test]
+fn set_analyze_off_overrides_analyze_statement() {
+    let script = parse("ANALYZE;\nSET ANALYZE = OFF;\nUSE db.xml SELECT GROUP arms;").unwrap();
+    assert!(!Settings::resolve(&script.settings).analyze);
+}
+
+#[test]
+fn unknown_setting_is_an_error() {
+    let err = parse("SET bogus = ON;").unwrap_err();
+    assert!(err.message.contains("unknown setting `bogus`"), "{}", err.message);
+    assert!(err.message.contains("FORMAT"));
+}
+
+#[test]
+fn setting_value_must_be_on_or_off() {
+    let err = parse("SET format = maybe;").unwrap_err();
+    assert!(err.message.contains("expected ON or OFF"), "{}", err.message);
 }
 
 #[test]

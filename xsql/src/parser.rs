@@ -1,11 +1,30 @@
 //! Recursive-descent parser: tokens -> `ast::Script`.
 
+use std::time::{Duration, Instant};
+
 use crate::ast::*;
 use crate::error::{Result, Span, XsqlError};
 use crate::lexer::{Tok, Token, lex};
 
 pub fn parse(source: &str) -> Result<Script> {
     parse_session(source, None).map(|(script, _)| script)
+}
+
+pub struct ParseTimes {
+    pub lex: Duration,
+    pub parse: Duration,
+}
+
+/// Like [`parse`], but reports how long lexing and parsing each took
+/// (feeds the `ANALYZE` report).
+pub fn parse_with_times(source: &str) -> Result<(Script, ParseTimes)> {
+    let lex_start = Instant::now();
+    let tokens = lex(source)?;
+    let lex_time = lex_start.elapsed();
+    let parse_start = Instant::now();
+    let (script, _) = Parser { tokens, pos: 0 }.script(None)?;
+    let times = ParseTimes { lex: lex_time, parse: parse_start.elapsed() };
+    Ok((script, times))
 }
 
 /// Parses with an inherited sticky `USE` source (REPL mode: the current
@@ -81,12 +100,26 @@ impl Parser {
 
     fn script(mut self, mut current: Option<Source>) -> Result<(Script, Option<Source>)> {
         let mut blocks = Vec::new();
+        let mut settings = Vec::new();
         // `USE` is sticky: once declared it applies to every following block
         // until another `USE` appears.
         loop {
             while self.eat(&Tok::Semi) {}
             if self.peek() == &Tok::Eof {
-                return Ok((Script { blocks }, current));
+                return Ok((Script { blocks, settings }, current));
+            }
+            // Global statements: no document required.
+            if self.peek() == &Tok::Analyze {
+                let span = self.span();
+                self.bump();
+                settings.push(SettingStmt { setting: Setting::Analyze, value: true, span });
+                self.statement_end()?;
+                continue;
+            }
+            if self.peek() == &Tok::Set {
+                settings.push(self.global_set()?);
+                self.statement_end()?;
+                continue;
             }
             let span = self.span();
             if self.eat(&Tok::Use) {
@@ -105,10 +138,86 @@ impl Parser {
             let verb_span = self.span();
             let verb = self.verb()?;
             blocks.push(Block { source, verb, span: verb_span });
-            if self.peek() != &Tok::Eof {
-                self.expect(Tok::Semi, "to terminate the statement block")?;
-            }
+            self.statement_end()?;
         }
+    }
+
+    fn statement_end(&mut self) -> Result<()> {
+        if self.peek() != &Tok::Eof {
+            self.expect(Tok::Semi, "to terminate the statement block")?;
+        }
+        Ok(())
+    }
+
+    /// `SET <name> = ON|OFF` at script scope (distinct from the FOREACH-level
+    /// `SET var.attr = expr`, which is handled inside `foreach`).
+    fn global_set(&mut self) -> Result<SettingStmt> {
+        let span = self.span();
+        self.bump(); // SET
+        let name_span = self.span();
+        let name = match self.peek().clone() {
+            Tok::Ident(name) => {
+                self.bump();
+                name
+            }
+            // `ANALYZE` lexes as a keyword but is also a setting name.
+            Tok::Analyze => {
+                self.bump();
+                "ANALYZE".to_string()
+            }
+            other => {
+                return Err(XsqlError::spanned(
+                    format!("expected setting name after SET, found {}", other.describe()),
+                    name_span,
+                ));
+            }
+        };
+        let setting = match name.to_ascii_uppercase().as_str() {
+            "FORMAT" => Setting::Format,
+            "IGNORE_COMMENTS" => Setting::IgnoreComments,
+            "ANALYZE" => Setting::Analyze,
+            _ => {
+                return Err(XsqlError::spanned(
+                    format!("unknown setting `{name}` (known settings: FORMAT, IGNORE_COMMENTS, ANALYZE)"),
+                    name_span,
+                ));
+            }
+        };
+        self.expect(Tok::Eq, "after the setting name")?;
+        let value_span = self.span();
+        let value = match self.peek().clone() {
+            Tok::Ident(word) => match word.to_ascii_uppercase().as_str() {
+                "ON" | "TRUE" => {
+                    self.bump();
+                    true
+                }
+                "OFF" | "FALSE" => {
+                    self.bump();
+                    false
+                }
+                _ => {
+                    return Err(XsqlError::spanned(
+                        format!("expected ON or OFF as the setting value, found `{word}`"),
+                        value_span,
+                    ));
+                }
+            },
+            Tok::Num(n) if n == 1.0 => {
+                self.bump();
+                true
+            }
+            Tok::Num(n) if n == 0.0 => {
+                self.bump();
+                false
+            }
+            other => {
+                return Err(XsqlError::spanned(
+                    format!("expected ON or OFF as the setting value, found {}", other.describe()),
+                    value_span,
+                ));
+            }
+        };
+        Ok(SettingStmt { setting, value, span })
     }
 
     fn use_source(&mut self) -> Result<Source> {

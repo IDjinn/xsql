@@ -1,4 +1,4 @@
-use xsql::eval::{Session, run};
+use xsql::eval::{Session, run, run_with_report};
 use xsql::parser::{parse, parse_session};
 
 fn fixture_path() -> String {
@@ -142,6 +142,75 @@ fn missing_group_reports_source() {
     let script = parse(&format!("USE {} SELECT GROUP nope;", fixture_path())).unwrap();
     let err = run(&script, None).unwrap_err();
     assert!(err.message.contains("`nope` not found"), "{}", err.message);
+}
+
+#[test]
+fn format_off_serializes_compact() {
+    let xml = r#"<db><arms><ItemSpec id="1" cost="5"/><ItemSpec id="2" cost="6"/></arms></db>"#;
+    let script = parse("SET FORMAT = OFF;\nUSE INPUT SELECT GROUP arms;\nFOREACH a IN arms SET a.cost = 9;").unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    // SELECT subtree and the modified document each occupy one line: no indentation.
+    assert!(!out.contains("    <"), "{out}");
+    assert!(out.contains(r#"<arms><ItemSpec id="1" cost="5"/><ItemSpec id="2" cost="6"/></arms>"#));
+    assert!(out.contains(r#"<db><arms><ItemSpec id="1" cost="9"/><ItemSpec id="2" cost="9"/></arms></db>"#));
+}
+
+#[test]
+fn comments_dropped_by_default() {
+    let xml = r#"<db><arms><!-- keep me --><ItemSpec id="1"/></arms></db>"#;
+    let script = parse("USE INPUT FOREACH a IN arms SET a.cost = 1;").unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert!(!out.contains("keep me"));
+}
+
+#[test]
+fn ignore_comments_off_preserves_comments() {
+    let xml = r#"<db><arms><!-- keep me --><ItemSpec id="1"/></arms></db>"#;
+    let script = parse(
+        "SET IGNORE_COMMENTS = OFF;\nUSE INPUT FOREACH a IN arms SET a.cost = 1;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert!(out.contains("<!-- keep me -->"), "{out}");
+    // The comment is not a loop element: only the real child got the attribute.
+    assert_eq!(out.matches(r#"cost="1""#).count(), 1, "{out}");
+}
+
+#[test]
+fn analyze_returns_timing_report() {
+    let xml = r#"<db><arms><ItemSpec id="1"/></arms></db>"#;
+    let script = parse("ANALYZE;\nUSE INPUT SELECT GROUP arms;").unwrap();
+    let (out, report) = run_with_report(&script, Some(xml.to_string())).unwrap();
+    assert!(out.contains(r#"<ItemSpec id="1"/>"#));
+    let mut report = report.expect("ANALYZE should produce a report");
+    report.prepend(vec![("lex".to_string(), std::time::Duration::from_micros(42))]);
+    let rendered = report.render(std::time::Duration::from_micros(999));
+    assert!(rendered.contains("-- ANALYZE"), "{rendered}");
+    assert!(rendered.contains("lex"), "{rendered}");
+    assert!(rendered.contains("parse xml  <stdin>"), "{rendered}");
+    assert!(rendered.contains("block #1   SELECT   <stdin>"), "{rendered}");
+    assert!(rendered.contains("serialize"), "{rendered}");
+    assert!(rendered.contains("assemble output"), "{rendered}");
+    assert!(rendered.contains("memory (documents)"), "{rendered}");
+    assert!(rendered.contains("total"), "{rendered}");
+    assert!(report.memory_bytes.unwrap() > 0);
+}
+
+#[test]
+fn analyze_report_times_file_read_separately() {
+    let script = parse(&format!("ANALYZE;\nUSE {} SELECT GROUP arms;", fixture_path())).unwrap();
+    let (_, report) = run_with_report(&script, None).unwrap();
+    let rendered = report.unwrap().render(std::time::Duration::ZERO);
+    assert!(rendered.contains("read       "), "{rendered}");
+    assert!(rendered.contains("parse xml  "), "{rendered}");
+}
+
+#[test]
+fn no_analyze_means_no_report() {
+    let xml = r#"<db><arms><ItemSpec id="1"/></arms></db>"#;
+    let script = parse("USE INPUT SELECT GROUP arms;").unwrap();
+    let (_, report) = run_with_report(&script, Some(xml.to_string())).unwrap();
+    assert!(report.is_none());
 }
 
 /// REPL-style session: sticky USE and in-memory mutations persist across

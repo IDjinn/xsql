@@ -67,6 +67,11 @@ FOREACH office IN office
 ; more verbs
 INSERT INTO GROUP goods RAW XML `<ItemSpec id="999"/>`;
 DELETE GROUP legacy_stuff;
+
+; global settings (any script position, apply to the whole run)
+SET FORMAT = OFF;          compact single-line XML output
+SET IGNORE_COMMENTS = OFF; preserve XML comments in loaded documents
+ANALYZE;                   print per-stage timings to stderr
 ```
 
 ### Reference
@@ -84,6 +89,16 @@ DELETE GROUP legacy_stuff;
 | `DELETE [IGNORE] v.attr` | removes an attribute (`IGNORE`: no error if absent) |
 | `DELETE v` | removes the current element |
 | `BREAK` | stops the loop |
+| `SET <setting> = ON\|OFF` | global setting (script scope, needs no `USE`); persists across REPL statements |
+| `ANALYZE` | shorthand for `SET ANALYZE = ON`: per-stage timing report on stderr |
+
+Settings (values `ON`/`OFF`, also `TRUE`/`FALSE`/`1`/`0`; names case-insensitive):
+
+| Setting | Default | Effect |
+|---|---|---|
+| `FORMAT` | `ON` | `ON`: pretty-printed XML output; `OFF`: compact, one line per document/selected element |
+| `IGNORE_COMMENTS` | `ON` | `ON`: XML comments are dropped when parsing; `OFF`: comments are preserved and re-emitted (they are never loop elements) |
+| `ANALYZE` | `OFF` | `ON`: after the run, prints a per-stage report to stderr — lex, parse, stdin/file read, XML parse per document, per-block execution, serialization, output assembly, stdout write, total DOM memory, total time |
 
 A *group* is the first element whose tag — or `name`/`id` attribute — equals
 the given name. Group names may be identifiers (`arms`), numbers
@@ -114,5 +129,5 @@ Missing attributes compare as false (SQL-NULL-ish).
 
 ## Roadmap
 
-- Flag to preserve comments, attribute order and original formatting on
-  output (currently data-only pretty-print).
+- Preserve original formatting on output (attribute order is kept; comments
+  are kept with `SET IGNORE_COMMENTS = OFF`; whitespace layout is not).

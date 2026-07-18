@@ -5,6 +5,62 @@ use crate::error::Span;
 #[derive(Debug, Clone)]
 pub struct Script {
     pub blocks: Vec<Block>,
+    /// Global `SET <name> = ON|OFF` statements (and `ANALYZE;`, which is
+    /// sugar for `SET ANALYZE = ON`), in script order.
+    pub settings: Vec<SettingStmt>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingStmt {
+    pub setting: Setting,
+    pub value: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    /// Pretty-printed (ON, default) vs compact single-line XML output.
+    Format,
+    /// Drop XML comments while parsing (ON, default) vs preserve them.
+    IgnoreComments,
+    /// Print per-stage timings to stderr after the run.
+    Analyze,
+}
+
+/// Resolved global settings a script runs under.
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    pub format: bool,
+    pub ignore_comments: bool,
+    pub analyze: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            format: true,
+            ignore_comments: true,
+            analyze: false,
+        }
+    }
+}
+
+impl Settings {
+    pub fn apply(&mut self, stmt: &SettingStmt) {
+        match stmt.setting {
+            Setting::Format => self.format = stmt.value,
+            Setting::IgnoreComments => self.ignore_comments = stmt.value,
+            Setting::Analyze => self.analyze = stmt.value,
+        }
+    }
+
+    pub fn resolve(stmts: &[SettingStmt]) -> Self {
+        let mut settings = Self::default();
+        for stmt in stmts {
+            settings.apply(stmt);
+        }
+        settings
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -11,25 +11,92 @@
 //!    sequential semantics. Loops containing BREAK stay fully sequential.
 //! 4. Modified documents are serialized in parallel and appended to the
 //!    output in first-use order.
+//!
+//! Global `SET` statements (FORMAT, IGNORE_COMMENTS, ANALYZE) are resolved
+//! up front and apply to the whole run; `ANALYZE` prints a per-stage timing
+//! report to stderr.
 
 pub mod value;
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
-use crate::ast::{BinOp, Block, Expr, Foreach, Op, Script, Source, Verb};
+use crate::ast::{BinOp, Block, Expr, Foreach, Op, Script, Settings, Source, Verb};
 use crate::error::{Result, XsqlError};
 use crate::xml::dom::{Document, NodeId};
-use crate::xml::parse::{parse_document, parse_fragment};
-use crate::xml::serialize::{serialize_document, serialize_subtree};
+use crate::xml::parse::{parse_document_opts, parse_fragment_opts};
+use crate::xml::serialize::{serialize_document_opts, serialize_subtree_opts};
 
 use value::Value;
 
 /// Children count from which FOREACH switches to parallel evaluation.
 const PAR_FOREACH_THRESHOLD: usize = 1024;
 
+/// Timing lines collected for `ANALYZE`. The caller can prepend its own
+/// stages (lex, parse, stdin read) and append trailing ones (stdout write)
+/// before rendering.
+pub struct AnalyzeReport {
+    pub lines: Vec<(String, Duration)>,
+    /// Total in-memory DOM footprint of every loaded document, in bytes.
+    pub memory_bytes: Option<usize>,
+}
+
+impl AnalyzeReport {
+    pub fn prepend(&mut self, lines: Vec<(String, Duration)>) {
+        self.lines.splice(0..0, lines);
+    }
+
+    pub fn push(&mut self, label: impl Into<String>, time: Duration) {
+        self.lines.push((label.into(), time));
+    }
+
+    /// `total` is wall-clock time measured by the caller (stages overlap
+    /// under parallelism, so summing lines would overstate it).
+    pub fn render(&self, total: Duration) -> String {
+        let label_width = self
+            .lines
+            .iter()
+            .map(|(label, _)| label.len())
+            .max()
+            .unwrap_or(0)
+            .max(44);
+        let width = label_width + 13;
+        let mut out = format!("-- ANALYZE {}\n", "-".repeat(width.saturating_sub(11)));
+        for (label, time) in &self.lines {
+            out.push_str(&format!("{label:<label_width$}{:>13}\n", fmt_duration(*time)));
+        }
+        if let Some(bytes) = self.memory_bytes {
+            out.push_str(&format!(
+                "{:<label_width$}{:>13}\n",
+                "memory (documents)",
+                fmt_bytes(bytes)
+            ));
+        }
+        out.push_str(&format!("{:<label_width$}{:>13}\n", "total", fmt_duration(total)));
+        out.push_str(&format!("{}\n", "-".repeat(width)));
+        out
+    }
+}
+
 pub fn run(script: &Script, stdin_xml: Option<String>) -> Result<String> {
+    let start = Instant::now();
+    let (out, report) = run_with_report(script, stdin_xml)?;
+    if let Some(report) = report {
+        eprint!("{}", report.render(start.elapsed()));
+    }
+    Ok(out)
+}
+
+/// Like [`run`], but returns the `ANALYZE` timing report (when the script
+/// enables it) instead of printing it.
+pub fn run_with_report(
+    script: &Script,
+    stdin_xml: Option<String>,
+) -> Result<(String, Option<AnalyzeReport>)> {
+    let settings = Settings::resolve(&script.settings);
+
     // Distinct sources in first-use order.
     let mut sources: Vec<Source> = Vec::new();
     for block in &script.blocks {
@@ -45,11 +112,29 @@ pub fn run(script: &Script, stdin_xml: Option<String>) -> Result<String> {
         ));
     }
 
-    // 1. Parallel load.
-    let mut docs: Vec<Document> = sources
+    // 1. Parallel load, file read and XML parse timed separately.
+    let loaded: Vec<(Document, Vec<(String, Duration)>)> = sources
         .par_iter()
-        .map(|source| load_source(source, stdin_xml.as_deref()))
+        .map(|source| {
+            let mut lines = Vec::new();
+            let read_start = Instant::now();
+            let (name, content) = read_source(source, stdin_xml.as_deref())?;
+            if matches!(source, Source::File(_)) {
+                lines.push((format!("{:<10} {name}", "read"), read_start.elapsed()));
+            }
+            let parse_start = Instant::now();
+            let doc = parse_document_opts(&content, !settings.ignore_comments)
+                .map_err(|e| XsqlError::plain(format!("{name}: {e}")))?;
+            lines.push((format!("{:<10} {name}", "parse xml"), parse_start.elapsed()));
+            Ok((doc, lines))
+        })
         .collect::<Result<Vec<_>>>()?;
+    let mut docs = Vec::with_capacity(loaded.len());
+    let mut load_lines = Vec::new();
+    for (doc, lines) in loaded {
+        docs.push(doc);
+        load_lines.extend(lines);
+    }
 
     // 2. Group blocks by document, run groups in parallel.
     let source_index: HashMap<&Source, usize> =
@@ -62,6 +147,7 @@ pub fn run(script: &Script, stdin_xml: Option<String>) -> Result<String> {
     struct DocRun {
         outputs: Vec<(usize, String)>,
         modified: bool,
+        timings: Vec<(usize, Duration)>,
     }
 
     let runs: Vec<DocRun> = docs
@@ -70,14 +156,17 @@ pub fn run(script: &Script, stdin_xml: Option<String>) -> Result<String> {
         .map(|(doc, blocks)| {
             let mut outputs = Vec::new();
             let mut modified = false;
+            let mut timings = Vec::new();
             for &(block_idx, block) in blocks {
-                let result = run_block(doc, block)?;
+                let start = Instant::now();
+                let result = run_block(doc, block, &settings)?;
+                timings.push((block_idx, start.elapsed()));
                 modified |= result.modified;
                 if let Some(text) = result.output {
                     outputs.push((block_idx, text));
                 }
             }
-            Ok(DocRun { outputs, modified })
+            Ok(DocRun { outputs, modified, timings })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -87,13 +176,16 @@ pub fn run(script: &Script, stdin_xml: Option<String>) -> Result<String> {
     selects.sort_by_key(|(idx, _)| *idx);
 
     // 4. Serialize modified documents in parallel, first-use order.
+    let serialize_start = Instant::now();
     let serialized: Vec<String> = docs
         .par_iter()
         .zip(&runs)
         .filter(|(_, run)| run.modified)
-        .map(|(doc, _)| serialize_document(doc))
+        .map(|(doc, _)| serialize_document_opts(doc, settings.format))
         .collect();
+    let serialize_time = serialize_start.elapsed();
 
+    let assemble_start = Instant::now();
     let mut out = String::new();
     for (_, text) in selects {
         out.push_str(&text);
@@ -101,7 +193,66 @@ pub fn run(script: &Script, stdin_xml: Option<String>) -> Result<String> {
     for text in serialized {
         out.push_str(&text);
     }
-    Ok(out)
+    let assemble_time = assemble_start.elapsed();
+
+    let report = settings.analyze.then(|| {
+        let mut lines = load_lines;
+        let mut block_times: Vec<(usize, Duration)> =
+            runs.iter().flat_map(|r| r.timings.iter().copied()).collect();
+        block_times.sort_by_key(|(idx, _)| *idx);
+        for (idx, time) in block_times {
+            let block = &script.blocks[idx];
+            lines.push((
+                format!(
+                    "block #{:<3} {:<8} {}",
+                    idx + 1,
+                    verb_label(&block.verb),
+                    block.source.describe()
+                ),
+                time,
+            ));
+        }
+        lines.push(("serialize".to_string(), serialize_time));
+        lines.push(("assemble output".to_string(), assemble_time));
+        AnalyzeReport {
+            lines,
+            memory_bytes: Some(docs.iter().map(Document::memory_bytes).sum()),
+        }
+    });
+
+    Ok((out, report))
+}
+
+fn verb_label(verb: &Verb) -> &'static str {
+    match verb {
+        Verb::Select { .. } => "SELECT",
+        Verb::ReplaceGroup { .. } => "REPLACE",
+        Verb::InsertInto { .. } => "INSERT",
+        Verb::DeleteGroup { .. } => "DELETE",
+        Verb::Foreach(_) => "FOREACH",
+    }
+}
+
+fn fmt_duration(d: Duration) -> String {
+    let us = d.as_micros();
+    if us >= 1000 {
+        format!("{:.3} ms", us as f64 / 1000.0)
+    } else {
+        format!("{us} us")
+    }
+}
+
+fn fmt_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Incremental interpreter for the REPL: documents load lazily on first
@@ -111,23 +262,68 @@ pub fn run(script: &Script, stdin_xml: Option<String>) -> Result<String> {
 pub struct Session {
     stdin_xml: Option<String>,
     docs: Vec<(Source, Document, bool)>,
+    /// Global settings; `SET`/`ANALYZE` statements persist across execs.
+    settings: Settings,
 }
 
 impl Session {
     pub fn new(stdin_xml: Option<String>) -> Self {
-        Self { stdin_xml, docs: Vec::new() }
+        Self {
+            stdin_xml,
+            docs: Vec::new(),
+            settings: Settings::default(),
+        }
     }
 
     pub fn exec(&mut self, script: &Script) -> Result<String> {
+        for stmt in &script.settings {
+            self.settings.apply(stmt);
+        }
+        let settings = self.settings;
+        let total_start = Instant::now();
+        let mut timings: Vec<(String, Duration)> = Vec::new();
         let mut out = String::new();
-        for block in &script.blocks {
-            let idx = self.doc_index(&block.source)?;
+        for (block_idx, block) in script.blocks.iter().enumerate() {
+            let (idx, load_times) = self.doc_index(&block.source)?;
+            if settings.analyze {
+                if let Some((read_time, parse_time)) = load_times {
+                    if matches!(block.source, Source::File(_)) {
+                        timings.push((
+                            format!("{:<10} {}", "read", block.source.describe()),
+                            read_time,
+                        ));
+                    }
+                    timings.push((
+                        format!("{:<10} {}", "parse xml", block.source.describe()),
+                        parse_time,
+                    ));
+                }
+            }
             let (_, doc, modified) = &mut self.docs[idx];
-            let result = run_block(doc, block)?;
+            let start = Instant::now();
+            let result = run_block(doc, block, &settings)?;
+            if settings.analyze {
+                timings.push((
+                    format!(
+                        "block #{:<3} {:<8} {}",
+                        block_idx + 1,
+                        verb_label(&block.verb),
+                        block.source.describe()
+                    ),
+                    start.elapsed(),
+                ));
+            }
             *modified |= result.modified;
             if let Some(text) = result.output {
                 out.push_str(&text);
             }
+        }
+        if settings.analyze && !script.blocks.is_empty() {
+            let report = AnalyzeReport {
+                lines: timings,
+                memory_bytes: Some(self.docs.iter().map(|(_, doc, _)| doc.memory_bytes()).sum()),
+            };
+            eprint!("{}", report.render(total_start.elapsed()));
         }
         Ok(out)
     }
@@ -137,7 +333,7 @@ impl Session {
         self.docs
             .iter()
             .filter(|(_, _, modified)| *modified)
-            .map(|(_, doc, _)| serialize_document(doc))
+            .map(|(_, doc, _)| serialize_document_opts(doc, self.settings.format))
             .collect()
     }
 
@@ -145,9 +341,11 @@ impl Session {
         self.docs.iter().any(|(_, _, modified)| *modified)
     }
 
-    fn doc_index(&mut self, source: &Source) -> Result<usize> {
+    /// Returns the document's index, plus (read, XML-parse) times when this
+    /// call is the one that loaded it.
+    fn doc_index(&mut self, source: &Source) -> Result<(usize, Option<(Duration, Duration)>)> {
         if let Some(idx) = self.docs.iter().position(|(s, _, _)| s == source) {
-            return Ok(idx);
+            return Ok((idx, None));
         }
         if *source == Source::Input && self.stdin_xml.is_none() {
             return Err(XsqlError::plain(
@@ -155,22 +353,30 @@ impl Session {
                  (not available in interactive mode)",
             ));
         }
-        let doc = load_source(source, self.stdin_xml.as_deref())?;
+        let read_start = Instant::now();
+        let (name, content) = read_source(source, self.stdin_xml.as_deref())?;
+        let read_time = read_start.elapsed();
+        let parse_start = Instant::now();
+        let doc = parse_document_opts(&content, !self.settings.ignore_comments)
+            .map_err(|e| XsqlError::plain(format!("{name}: {e}")))?;
+        let times = (read_time, parse_start.elapsed());
         self.docs.push((source.clone(), doc, false));
-        Ok(self.docs.len() - 1)
+        Ok((self.docs.len() - 1, Some(times)))
     }
 }
 
-fn load_source(source: &Source, stdin_xml: Option<&str>) -> Result<Document> {
-    let (name, content) = match source {
-        Source::File(path) => (
-            path.as_str(),
+fn read_source(source: &Source, stdin_xml: Option<&str>) -> Result<(String, String)> {
+    match source {
+        Source::File(path) => Ok((
+            path.clone(),
             std::fs::read_to_string(path)
                 .map_err(|e| XsqlError::plain(format!("cannot read `{path}`: {e}")))?,
-        ),
-        Source::Input => ("<stdin>", stdin_xml.expect("checked by caller").to_string()),
-    };
-    parse_document(&content).map_err(|e| XsqlError::plain(format!("{name}: {e}")))
+        )),
+        Source::Input => Ok((
+            "<stdin>".to_string(),
+            stdin_xml.expect("checked by caller").to_string(),
+        )),
+    }
 }
 
 struct BlockResult {
@@ -178,20 +384,20 @@ struct BlockResult {
     modified: bool,
 }
 
-fn run_block(doc: &mut Document, block: &Block) -> Result<BlockResult> {
+fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<BlockResult> {
     match &block.verb {
         Verb::Select { group, foreach } => {
             let group_id = resolve_group(doc, group, block)?;
             match foreach {
                 None => Ok(BlockResult {
-                    output: Some(serialize_subtree(doc, group_id)),
+                    output: Some(serialize_subtree_opts(doc, group_id, settings.format)),
                     modified: false,
                 }),
                 Some(foreach) => {
                     let outcome = run_foreach(doc, group_id, foreach)?;
                     let mut text = String::new();
                     for id in outcome.selected {
-                        text.push_str(&serialize_subtree(doc, id));
+                        text.push_str(&serialize_subtree_opts(doc, id, settings.format));
                     }
                     Ok(BlockResult {
                         output: Some(text),
@@ -210,7 +416,7 @@ fn run_block(doc: &mut Document, block: &Block) -> Result<BlockResult> {
         }
         Verb::ReplaceGroup { group, xml, xml_span } => {
             let group_id = resolve_group(doc, group, block)?;
-            let fragment = parse_fragment(xml)
+            let fragment = parse_fragment_opts(xml, !settings.ignore_comments)
                 .map_err(|e| XsqlError::spanned(format!("bad RAW XML: {e}"), *xml_span))?;
             for child in std::mem::take(&mut doc.node_mut(group_id).children) {
                 doc.node_mut(child).parent = None;
@@ -220,7 +426,7 @@ fn run_block(doc: &mut Document, block: &Block) -> Result<BlockResult> {
         }
         Verb::InsertInto { group, xml, xml_span } => {
             let group_id = resolve_group(doc, group, block)?;
-            let fragment = parse_fragment(xml)
+            let fragment = parse_fragment_opts(xml, !settings.ignore_comments)
                 .map_err(|e| XsqlError::spanned(format!("bad RAW XML: {e}"), *xml_span))?;
             doc.graft(fragment, group_id);
             Ok(BlockResult { output: None, modified: true })
@@ -272,7 +478,14 @@ struct ForeachOutcome {
 }
 
 fn run_foreach(doc: &mut Document, group_id: NodeId, foreach: &Foreach) -> Result<ForeachOutcome> {
-    let children: Vec<NodeId> = doc.node(group_id).children.clone();
+    // Comment nodes (IGNORE_COMMENTS = OFF) are not loop elements.
+    let children: Vec<NodeId> = doc
+        .node(group_id)
+        .children
+        .iter()
+        .copied()
+        .filter(|&child| !doc.node(child).is_comment())
+        .collect();
     let has_break = foreach.ops.iter().any(|op| matches!(op, Op::Break));
 
     let mut outcome = ForeachOutcome { selected: Vec::new(), mutations: 0 };

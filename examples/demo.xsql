@@ -1,5 +1,11 @@
 ; xsql demo — run from the repo root:
 ;   cargo run -- examples/demo.xsql
+
+; global settings: ANALYZE prints per-stage timings to stderr;
+; SET tweaks behavior for the whole run (FORMAT, IGNORE_COMMENTS, ANALYZE)
+ANALYZE;
+SET FORMAT = ON;
+
 USE xsql-tests/fixtures/database.local.xml
 
 ; strip science attributes from every arm

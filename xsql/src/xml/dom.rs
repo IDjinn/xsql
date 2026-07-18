@@ -4,6 +4,11 @@
 
 pub type NodeId = usize;
 
+/// Reserved tag marking a comment node (`IGNORE_COMMENTS = OFF`): the comment
+/// text lives in `text`. `!` can never start a real XML tag name, so this
+/// cannot collide with an element.
+pub const COMMENT_TAG: &str = "!--";
+
 #[derive(Debug, Clone)]
 pub struct Element {
     pub tag: String,
@@ -16,6 +21,10 @@ pub struct Element {
 }
 
 impl Element {
+    pub fn is_comment(&self) -> bool {
+        self.tag == COMMENT_TAG
+    }
+
     pub fn attr(&self, name: &str) -> Option<&str> {
         self.attrs
             .iter()
@@ -60,6 +69,15 @@ impl Document {
         self.nodes.len() - 1
     }
 
+    /// Approximate heap footprint of the DOM arena, in bytes (nodes plus
+    /// their strings/attribute/children buffers).
+    pub fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.nodes.capacity() * std::mem::size_of::<Element>()
+            + self.nodes.iter().map(element_bytes).sum::<usize>()
+            + self.roots.capacity() * std::mem::size_of::<NodeId>()
+    }
+
     /// Finds a "group": the first element (document order, depth-first) whose
     /// tag equals `name`, or whose `name`/`id` attribute equals `name`.
     pub fn find_group(&self, name: &str) -> Option<NodeId> {
@@ -95,4 +113,12 @@ impl Document {
         self.nodes[parent].children.extend(&roots);
         roots
     }
+}
+
+fn element_bytes(el: &Element) -> usize {
+    el.tag.capacity()
+        + el.text.capacity()
+        + el.attrs.capacity() * std::mem::size_of::<(String, String)>()
+        + el.attrs.iter().map(|(k, v)| k.capacity() + v.capacity()).sum::<usize>()
+        + el.children.capacity() * std::mem::size_of::<NodeId>()
 }

@@ -1,12 +1,18 @@
-//! XML text -> arena DOM, built on quick-xml. Comments, processing
-//! instructions and DOCTYPE are skipped (data-only mode for now).
+//! XML text -> arena DOM, built on quick-xml. Processing instructions and
+//! DOCTYPE are skipped; comments are skipped too unless `keep_comments` is
+//! set (`SET IGNORE_COMMENTS = OFF`), in which case they become nodes with
+//! the reserved [`COMMENT_TAG`] tag.
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-use super::dom::{Document, Element, NodeId};
+use super::dom::{COMMENT_TAG, Document, Element, NodeId};
 
 pub fn parse_document(source: &str) -> Result<Document, String> {
+    parse_document_opts(source, false)
+}
+
+pub fn parse_document_opts(source: &str, keep_comments: bool) -> Result<Document, String> {
     let mut reader = Reader::from_str(source);
     reader.config_mut().trim_text(true);
 
@@ -38,6 +44,21 @@ pub fn parse_document(source: &str) -> Result<Document, String> {
                     doc.node_mut(id).text.push_str(&value);
                 }
             }
+            Ok(Event::Comment(comment)) if keep_comments => {
+                let text = String::from_utf8_lossy(comment.as_ref()).into_owned();
+                let parent = stack.last().copied();
+                let id = doc.push(Element {
+                    tag: COMMENT_TAG.to_string(),
+                    attrs: Vec::new(),
+                    children: Vec::new(),
+                    text,
+                    parent,
+                });
+                match parent {
+                    Some(p) => doc.node_mut(p).children.push(id),
+                    None => doc.roots.push(id),
+                }
+            }
             Ok(Event::Comment(_) | Event::PI(_) | Event::DocType(_)) => {}
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -55,7 +76,11 @@ pub fn parse_document(source: &str) -> Result<Document, String> {
 /// Parses an XML fragment (zero or more sibling elements) into a standalone
 /// document whose `roots` are the fragment's top-level elements.
 pub fn parse_fragment(source: &str) -> Result<Document, String> {
-    parse_document(source)
+    parse_document_opts(source, false)
+}
+
+pub fn parse_fragment_opts(source: &str, keep_comments: bool) -> Result<Document, String> {
+    parse_document_opts(source, keep_comments)
 }
 
 fn open_element(
