@@ -250,6 +250,17 @@ impl Parser {
                 let group = self.group_name()?;
                 let foreach = if self.peek() == &Tok::Foreach {
                     Some(self.foreach()?)
+                } else if self.peek() == &Tok::Output {
+                    // `SELECT GROUP g OUTPUT ...` — implicit loop over the
+                    // group's children.
+                    let output_span = self.span();
+                    let op = self.output_op()?;
+                    Some(Foreach {
+                        var: group.clone(),
+                        group: group.clone(),
+                        ops: vec![op],
+                        span: output_span,
+                    })
                 } else {
                     None
                 };
@@ -270,6 +281,14 @@ impl Parser {
                 let (xml, xml_span) = self.raw_xml()?;
                 Ok(Verb::InsertInto { group, xml, xml_span })
             }
+            Tok::Merge => {
+                self.bump();
+                self.expect(Tok::Into, "after MERGE")?;
+                self.expect(Tok::Group, "after MERGE INTO")?;
+                let group = self.group_name()?;
+                let (xml, xml_span) = self.raw_xml()?;
+                Ok(Verb::MergeInto { group, xml, xml_span })
+            }
             Tok::Delete => {
                 self.bump();
                 let ignore = self.eat(&Tok::Ignore);
@@ -280,7 +299,7 @@ impl Parser {
             Tok::Foreach => Ok(Verb::Foreach(self.foreach()?)),
             other => Err(XsqlError::spanned(
                 format!(
-                    "expected SELECT, REPLACE, INSERT, DELETE or FOREACH after USE, found {}",
+                    "expected SELECT, REPLACE, INSERT, MERGE, DELETE or FOREACH after USE, found {}",
                     other.describe()
                 ),
                 span,
@@ -347,7 +366,31 @@ impl Parser {
             match self.peek().clone() {
                 Tok::Where => {
                     self.bump();
-                    ops.push(Op::Where(self.expr()?));
+                    if self.eat(&Tok::Required) {
+                        let span = self.span();
+                        // Peek (don't consume) the attribute reference: the
+                        // same token then re-parses as the condition's lhs,
+                        // so `WHERE REQUIRED cost > 100` needs `cost` once.
+                        let (var, attr) = match self.peek().clone() {
+                            Tok::Ident(name) => match name.split_once('.') {
+                                Some((v, a)) => (v.to_string(), a.to_string()),
+                                None => (String::new(), name),
+                            },
+                            other => {
+                                return Err(XsqlError::spanned(
+                                    format!(
+                                        "expected attribute reference after WHERE REQUIRED, found {}",
+                                        other.describe()
+                                    ),
+                                    span,
+                                ));
+                            }
+                        };
+                        let expr = self.expr()?;
+                        ops.push(Op::WhereRequired { var, attr, expr, span });
+                    } else {
+                        ops.push(Op::Where(self.expr()?));
+                    }
                 }
                 Tok::Set => {
                     let span = self.span();
@@ -357,6 +400,21 @@ impl Parser {
                     self.expect(Tok::Eq, "after the SET target")?;
                     let value = self.expr()?;
                     ops.push(Op::Set { var, attr, value, span });
+                }
+                Tok::Merge => {
+                    let span = self.span();
+                    self.bump();
+                    let (target, target_span) = self.ident("after MERGE")?;
+                    let (var, attr) = split_attr_ref(&target, target_span)?;
+                    self.expect(Tok::Eq, "after the MERGE target")?;
+                    let value = self.expr()?;
+                    ops.push(Op::Merge { var, attr, value, span });
+                }
+                Tok::Foreach => {
+                    ops.push(Op::Foreach(Box::new(self.foreach()?)));
+                }
+                Tok::Output => {
+                    ops.push(self.output_op()?);
                 }
                 Tok::Delete => {
                     let span = self.span();
@@ -382,6 +440,41 @@ impl Parser {
         }
 
         Ok(Foreach { var, group, ops, span })
+    }
+
+    /// `OUTPUT *` | `OUTPUT expr [AS name] (, expr [AS name])*` — the caller
+    /// has peeked the OUTPUT token.
+    fn output_op(&mut self) -> Result<Op> {
+        let span = self.span();
+        self.expect(Tok::Output, "to start the projection")?;
+        if self.eat(&Tok::Star) {
+            return Ok(Op::Output { all: true, items: Vec::new(), span });
+        }
+        let mut items = Vec::new();
+        loop {
+            let item_span = self.span();
+            let expr = self.expr()?;
+            let alias = if self.eat(&Tok::As) {
+                Some(self.ident("after AS")?.0)
+            } else {
+                None
+            };
+            let name = match (alias, &expr) {
+                (Some(name), _) => name,
+                (None, Expr::Attr { attr, .. }) => attr.clone(),
+                (None, _) => {
+                    return Err(XsqlError::spanned(
+                        "an OUTPUT expression needs a name: add `AS <name>`",
+                        item_span,
+                    ));
+                }
+            };
+            items.push((expr, name));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(Op::Output { all: false, items, span })
     }
 
     fn expr(&mut self) -> Result<Expr> {

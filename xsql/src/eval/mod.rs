@@ -6,9 +6,13 @@
 //!    run **in parallel** (blocks within one document stay sequential).
 //!    SELECT output is buffered per block and flushed in script order.
 //! 3. Large FOREACH loops use evaluate-then-apply: expressions are evaluated
-//!    read-only **in parallel** over the children (each producing a mutation
-//!    plan), then plans are applied sequentially — preserving exact
-//!    sequential semantics. Loops containing BREAK stay fully sequential.
+//!    read-only **in parallel** over the children (each producing an ordered
+//!    mutation plan), then plans are applied sequentially — preserving exact
+//!    sequential semantics. Loops with a top-level BREAK stay fully
+//!    sequential (a BREAK inside a nested FOREACH only ends that inner loop,
+//!    so it doesn't force sequential execution). Nested loops only ever
+//!    touch the current top-level child's subtree, which is what keeps the
+//!    parallel planning safe.
 //! 4. Modified documents are serialized in parallel and appended to the
 //!    output in first-use order.
 //!
@@ -24,10 +28,10 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::ast::{BinOp, Block, Expr, Foreach, Op, Script, Settings, Source, Verb};
-use crate::error::{Result, XsqlError};
-use crate::xml::dom::{Document, NodeId};
+use crate::error::{Result, Span, XsqlError};
+use crate::xml::dom::{Document, Element, NodeId};
 use crate::xml::parse::{parse_document_opts, parse_fragment_opts};
-use crate::xml::serialize::{serialize_document_opts, serialize_subtree_opts};
+use crate::xml::serialize::{escape_attr_into, serialize_document_opts, serialize_subtree_opts};
 
 use value::Value;
 
@@ -228,6 +232,7 @@ fn verb_label(verb: &Verb) -> &'static str {
         Verb::Select { .. } => "SELECT",
         Verb::ReplaceGroup { .. } => "REPLACE",
         Verb::InsertInto { .. } => "INSERT",
+        Verb::MergeInto { .. } => "MERGE",
         Verb::DeleteGroup { .. } => "DELETE",
         Verb::Foreach(_) => "FOREACH",
     }
@@ -395,10 +400,17 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
                 }),
                 Some(foreach) => {
                     let outcome = run_foreach(doc, group_id, foreach)?;
-                    let mut text = String::new();
-                    for id in outcome.selected {
-                        text.push_str(&serialize_subtree_opts(doc, id, settings.format));
-                    }
+                    // An OUTPUT op takes over what gets printed; without one
+                    // the elements passing every WHERE print in full.
+                    let text = if foreach_has_output(foreach) {
+                        render_emits(doc, &outcome.emits, settings)
+                    } else {
+                        outcome
+                            .selected
+                            .iter()
+                            .map(|&id| serialize_subtree_opts(doc, id, settings.format))
+                            .collect()
+                    };
                     Ok(BlockResult {
                         output: Some(text),
                         modified: outcome.mutations > 0,
@@ -409,8 +421,11 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
         Verb::Foreach(foreach) => {
             let group_id = resolve_group(doc, &foreach.group, block)?;
             let outcome = run_foreach(doc, group_id, foreach)?;
+            // A mutation loop with OUTPUT also prints its emissions.
+            let output = foreach_has_output(foreach)
+                .then(|| render_emits(doc, &outcome.emits, settings));
             Ok(BlockResult {
-                output: None,
+                output,
                 modified: outcome.mutations > 0,
             })
         }
@@ -430,6 +445,13 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
                 .map_err(|e| XsqlError::spanned(format!("bad RAW XML: {e}"), *xml_span))?;
             doc.graft(fragment, group_id);
             Ok(BlockResult { output: None, modified: true })
+        }
+        Verb::MergeInto { group, xml, xml_span } => {
+            let group_id = resolve_group(doc, group, block)?;
+            let fragment = parse_fragment_opts(xml, !settings.ignore_comments)
+                .map_err(|e| XsqlError::spanned(format!("bad RAW XML: {e}"), *xml_span))?;
+            let modified = merge_into(doc, group_id, &fragment);
+            Ok(BlockResult { output: None, modified })
         }
         Verb::DeleteGroup { group, ignore } => match doc.find_group(group) {
             Some(group_id) => {
@@ -457,24 +479,130 @@ fn group_not_found(group: &str, block: &Block) -> XsqlError {
 }
 
 // ---------------------------------------------------------------------------
+// MERGE INTO (upsert)
+// ---------------------------------------------------------------------------
+
+/// `MERGE INTO GROUP`: each fragment element is matched against the group's
+/// children; matched elements get the cited attributes written over them
+/// (other attributes preserved; the fragment's children, when present,
+/// replace the existing ones), unmatched elements are inserted. Returns
+/// whether anything actually changed, so idempotent re-runs don't mark the
+/// document modified.
+fn merge_into(doc: &mut Document, group_id: NodeId, fragment: &Document) -> bool {
+    let mut modified = false;
+    for &root in &fragment.roots {
+        let frag_el = fragment.node(root);
+        let target = if frag_el.is_comment() {
+            None
+        } else {
+            find_merge_target(doc, group_id, frag_el)
+        };
+        match target {
+            Some(existing) => {
+                for (attr, value) in &frag_el.attrs {
+                    if doc.node(existing).attr(attr) != Some(value.as_str()) {
+                        doc.node_mut(existing).set_attr(attr, value.clone());
+                        modified = true;
+                    }
+                }
+                if !frag_el.children.is_empty() {
+                    for child in std::mem::take(&mut doc.node_mut(existing).children) {
+                        doc.node_mut(child).parent = None;
+                    }
+                    for &frag_child in &frag_el.children {
+                        doc.copy_subtree(fragment, frag_child, existing);
+                    }
+                    modified = true;
+                }
+            }
+            None => {
+                doc.copy_subtree(fragment, root, group_id);
+                modified = true;
+            }
+        }
+    }
+    modified
+}
+
+/// First non-comment child matching the fragment element: same `id`
+/// attribute when the fragment cites one, else same `name`, else same tag.
+fn find_merge_target(doc: &Document, group_id: NodeId, frag_el: &Element) -> Option<NodeId> {
+    let key = frag_el
+        .attr("id")
+        .map(|v| ("id", v))
+        .or_else(|| frag_el.attr("name").map(|v| ("name", v)));
+    doc.node(group_id).children.iter().copied().find(|&child| {
+        let el = doc.node(child);
+        if el.is_comment() {
+            return false;
+        }
+        match key {
+            Some((k, v)) => el.attr(k) == Some(v),
+            None => el.tag == frag_el.tag,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // FOREACH engine (evaluate-then-apply)
 // ---------------------------------------------------------------------------
 
-/// Planned effects for one child element, computed read-only.
-#[derive(Debug, Default)]
+/// One planned mutation, kept in execution order (nested loops interleave
+/// writes to the current element, its descendants and enclosing elements).
+#[derive(Debug)]
+enum Action {
+    Set(String, String),
+    DelAttr(String),
+    DeleteElem,
+}
+
+/// One OUTPUT emission, in reach order. Projections (`OUTPUT a, b`) are
+/// rendered at reach time from the overlay; `OUTPUT *` defers to the
+/// serializer after mutations apply — same as a SELECT without OUTPUT.
+#[derive(Debug)]
+enum Emit {
+    Node(NodeId),
+    Text(String),
+}
+
+/// Planned effects for one top-level child element, computed read-only.
+#[derive(Debug)]
 struct ChildPlan {
     /// Passed every WHERE guard it reached (still true for deleted elements,
     /// but deleted elements are never selected for output).
     selected: bool,
     broke: bool,
-    sets: Vec<(String, String)>,
-    del_attrs: Vec<String>,
-    delete_elem: bool,
+    actions: Vec<(NodeId, Action)>,
+    emits: Vec<Emit>,
 }
 
 struct ForeachOutcome {
     selected: Vec<NodeId>,
+    emits: Vec<Emit>,
     mutations: usize,
+}
+
+/// Whether the loop (or any nested loop) contains an OUTPUT op — when it
+/// does, SELECT prints the emissions instead of the legacy selected list.
+fn foreach_has_output(foreach: &Foreach) -> bool {
+    foreach.ops.iter().any(|op| match op {
+        Op::Output { .. } => true,
+        Op::Foreach(inner) => foreach_has_output(inner),
+        _ => false,
+    })
+}
+
+/// Renders emissions in reach order. `Emit::Node` serializes after the
+/// mutations were applied, matching what a SELECT without OUTPUT prints.
+fn render_emits(doc: &Document, emits: &[Emit], settings: &Settings) -> String {
+    let mut text = String::new();
+    for emit in emits {
+        match emit {
+            Emit::Text(line) => text.push_str(line),
+            Emit::Node(id) => text.push_str(&serialize_subtree_opts(doc, *id, settings.format)),
+        }
+    }
+    text
 }
 
 fn run_foreach(doc: &mut Document, group_id: NodeId, foreach: &Foreach) -> Result<ForeachOutcome> {
@@ -488,7 +616,7 @@ fn run_foreach(doc: &mut Document, group_id: NodeId, foreach: &Foreach) -> Resul
         .collect();
     let has_break = foreach.ops.iter().any(|op| matches!(op, Op::Break));
 
-    let mut outcome = ForeachOutcome { selected: Vec::new(), mutations: 0 };
+    let mut outcome = ForeachOutcome { selected: Vec::new(), emits: Vec::new(), mutations: 0 };
 
     if !has_break && children.len() >= PAR_FOREACH_THRESHOLD {
         // Parallel read-only evaluation, then sequential apply.
@@ -515,115 +643,261 @@ fn run_foreach(doc: &mut Document, group_id: NodeId, foreach: &Foreach) -> Resul
 }
 
 fn apply_plan(doc: &mut Document, child: NodeId, plan: ChildPlan, outcome: &mut ForeachOutcome) {
-    outcome.mutations += plan.sets.len() + plan.del_attrs.len() + plan.delete_elem as usize;
-    let el = doc.node_mut(child);
-    for (attr, val) in plan.sets {
-        el.set_attr(&attr, val);
+    outcome.mutations += plan.actions.len();
+    let mut child_deleted = false;
+    for (node, action) in plan.actions {
+        match action {
+            Action::Set(attr, value) => doc.node_mut(node).set_attr(&attr, value),
+            Action::DelAttr(attr) => {
+                doc.node_mut(node).remove_attr(&attr);
+            }
+            Action::DeleteElem => {
+                doc.detach(node);
+                child_deleted |= node == child;
+            }
+        }
     }
-    for attr in plan.del_attrs {
-        el.remove_attr(&attr);
-    }
-    if plan.delete_elem {
-        doc.detach(child);
-    } else if plan.selected {
+    if plan.selected && !child_deleted {
         outcome.selected.push(child);
     }
+    outcome.emits.extend(plan.emits);
 }
 
-/// Attribute view of one child during planning: pending SET/DELETE ops are
-/// layered over the element so later expressions observe earlier writes.
-struct Overlay<'a> {
-    doc: &'a Document,
-    child: NodeId,
+/// One enclosing FOREACH binding during planning: the names resolving to
+/// `node`, plus the overlay of pending attribute writes so later expressions
+/// observe earlier ones.
+struct Scope<'a> {
+    var: &'a str,
+    /// Group-name alias for the element (the top-level loop's group, or a
+    /// nested loop's sub-group name); empty when the nested loop iterates an
+    /// enclosing variable's children — that name must keep resolving to the
+    /// enclosing scope.
+    alias: &'a str,
+    node: NodeId,
     changes: Vec<(String, Option<String>)>,
 }
 
-impl<'a> Overlay<'a> {
-    fn get(&self, attr: &str) -> Option<String> {
+impl Scope<'_> {
+    fn get(&self, doc: &Document, attr: &str) -> Option<String> {
         for (name, value) in self.changes.iter().rev() {
             if name == attr {
                 return value.clone();
             }
         }
-        self.doc.node(self.child).attr(attr).map(str::to_string)
+        doc.node(self.node).attr(attr).map(str::to_string)
     }
 }
 
-fn plan_child(doc: &Document, child: NodeId, foreach: &Foreach) -> Result<ChildPlan> {
-    let mut plan = ChildPlan { selected: true, ..ChildPlan::default() };
-    let mut overlay = Overlay { doc, child, changes: Vec::new() };
+/// The loop variable, the group name and a bare (empty) prefix all refer to
+/// the current element; enclosing loops' names stay visible (innermost wins).
+fn lookup_scope(scopes: &[Scope], var: &str) -> Option<usize> {
+    if var.is_empty() {
+        return scopes.len().checked_sub(1);
+    }
+    scopes
+        .iter()
+        .rposition(|s| s.var == var || (!s.alias.is_empty() && s.alias == var))
+}
 
+fn resolve_scope(scopes: &[Scope], var: &str, span: Span) -> Result<usize> {
+    lookup_scope(scopes, var).ok_or_else(|| {
+        let known: Vec<String> = scopes
+            .iter()
+            .flat_map(|s| [s.var, s.alias])
+            .filter(|n| !n.is_empty())
+            .map(|n| format!("`{n}`"))
+            .collect();
+        XsqlError::spanned(
+            format!("unknown variable `{var}` (in scope: {})", known.join(", ")),
+            span,
+        )
+    })
+}
+
+fn plan_child(doc: &Document, child: NodeId, foreach: &Foreach) -> Result<ChildPlan> {
+    let mut scopes = Vec::new();
+    let mut actions = Vec::new();
+    let mut emits = Vec::new();
+    let (selected, broke) =
+        plan_element(doc, child, foreach, &foreach.group, &mut scopes, &mut actions, &mut emits)?;
+    Ok(ChildPlan { selected, broke, actions, emits })
+}
+
+/// Plans one element of a loop (recursing into nested FOREACH), read-only.
+/// Returns (passed every WHERE it reached, hit BREAK).
+#[allow(clippy::too_many_arguments)]
+fn plan_element<'a>(
+    doc: &Document,
+    node: NodeId,
+    foreach: &'a Foreach,
+    alias: &'a str,
+    scopes: &mut Vec<Scope<'a>>,
+    actions: &mut Vec<(NodeId, Action)>,
+    emits: &mut Vec<Emit>,
+) -> Result<(bool, bool)> {
+    scopes.push(Scope { var: &foreach.var, alias, node, changes: Vec::new() });
+    let result = plan_ops(doc, foreach, scopes, actions, emits);
+    scopes.pop();
+    result
+}
+
+fn plan_ops<'a>(
+    doc: &Document,
+    foreach: &'a Foreach,
+    scopes: &mut Vec<Scope<'a>>,
+    actions: &mut Vec<(NodeId, Action)>,
+    emits: &mut Vec<Emit>,
+) -> Result<(bool, bool)> {
+    let mut selected = true;
     for op in &foreach.ops {
         match op {
             Op::Where(expr) => {
-                if !eval_expr(expr, foreach, &overlay)?.truthy() {
-                    plan.selected = false;
+                if !eval_expr(doc, expr, scopes)?.truthy() {
+                    selected = false;
+                    break;
+                }
+            }
+            Op::WhereRequired { var, attr, expr, span } => {
+                let idx = resolve_scope(scopes, var, *span)?;
+                if scopes[idx].get(doc, attr).is_none() {
+                    return Err(XsqlError::spanned(
+                        format!(
+                            "attribute `{attr}` is REQUIRED but missing on <{}> \
+                             (use plain WHERE to skip elements without it silently)",
+                            doc.node(scopes[idx].node).tag
+                        ),
+                        *span,
+                    ));
+                }
+                if !eval_expr(doc, expr, scopes)?.truthy() {
+                    selected = false;
                     break;
                 }
             }
             Op::Set { var, attr, value, span } => {
-                check_var(var, foreach, *span)?;
-                let value = eval_expr(value, foreach, &overlay)?.to_display();
-                overlay.changes.push((attr.clone(), Some(value.clone())));
-                plan.sets.push((attr.clone(), value));
+                let idx = resolve_scope(scopes, var, *span)?;
+                let value = eval_expr(doc, value, scopes)?.to_display();
+                let target = scopes[idx].node;
+                scopes[idx].changes.push((attr.clone(), Some(value.clone())));
+                actions.push((target, Action::Set(attr.clone(), value)));
+            }
+            Op::Merge { var, attr, value, span } => {
+                let idx = resolve_scope(scopes, var, *span)?;
+                if scopes[idx].get(doc, attr).is_none() {
+                    let value = eval_expr(doc, value, scopes)?.to_display();
+                    let target = scopes[idx].node;
+                    scopes[idx].changes.push((attr.clone(), Some(value.clone())));
+                    actions.push((target, Action::Set(attr.clone(), value)));
+                }
             }
             Op::DeleteAttr { var, attr, ignore, span } => {
-                check_var(var, foreach, *span)?;
-                if overlay.get(attr).is_some() {
-                    overlay.changes.push((attr.clone(), None));
-                    plan.del_attrs.push(attr.clone());
+                let idx = resolve_scope(scopes, var, *span)?;
+                if scopes[idx].get(doc, attr).is_some() {
+                    scopes[idx].changes.push((attr.clone(), None));
+                    actions.push((scopes[idx].node, Action::DelAttr(attr.clone())));
                 } else if !ignore {
                     return Err(XsqlError::spanned(
                         format!(
                             "attribute `{attr}` not found on <{}> (use DELETE IGNORE to skip silently)",
-                            doc.node(child).tag
+                            doc.node(scopes[idx].node).tag
                         ),
                         *span,
                     ));
                 }
             }
             Op::DeleteElem { var, ignore: _, span } => {
-                check_var(var, foreach, *span)?;
-                plan.delete_elem = true;
-                break;
+                let idx = resolve_scope(scopes, var, *span)?;
+                actions.push((scopes[idx].node, Action::DeleteElem));
+                // Deleting the current element ends its planning; deleting an
+                // enclosing element leaves this loop running over the
+                // (already snapshotted) children.
+                if idx == scopes.len() - 1 {
+                    break;
+                }
             }
-            Op::Break => {
-                plan.broke = true;
-                break;
+            Op::Break => return Ok((selected, true)),
+            Op::Foreach(inner) => {
+                let (parent, inner_alias) = resolve_loop_source(doc, scopes, inner)?;
+                let kids: Vec<NodeId> = doc
+                    .node(parent)
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&kid| !doc.node(kid).is_comment())
+                    .collect();
+                for kid in kids {
+                    let (_, broke) =
+                        plan_element(doc, kid, inner, inner_alias, scopes, actions, emits)?;
+                    if broke {
+                        break;
+                    }
+                }
+            }
+            Op::Output { all, items, span: _ } => {
+                let node = scopes.last().expect("OUTPUT has an enclosing scope").node;
+                if *all {
+                    emits.push(Emit::Node(node));
+                } else {
+                    // Rendered at reach time from the overlay: SETs before
+                    // the OUTPUT are visible, later ones are not. Missing
+                    // attributes are omitted.
+                    let mut line = format!("<{}", doc.node(node).tag);
+                    for (expr, name) in items {
+                        let value = eval_expr(doc, expr, scopes)?;
+                        if !matches!(value, Value::Null) {
+                            line.push(' ');
+                            line.push_str(name);
+                            line.push_str("=\"");
+                            escape_attr_into(&value.to_display(), &mut line);
+                            line.push('"');
+                        }
+                    }
+                    line.push_str("/>\n");
+                    emits.push(Emit::Text(line));
+                }
             }
         }
     }
-
-    Ok(plan)
+    Ok((selected, false))
 }
 
-/// The loop variable, the group name and a bare (empty) prefix all refer to
-/// the current element — the scratch-file scripts use them interchangeably.
-fn check_var(var: &str, foreach: &Foreach, span: crate::error::Span) -> Result<()> {
-    if var.is_empty() || var == foreach.var || var == foreach.group {
-        Ok(())
-    } else {
-        Err(XsqlError::spanned(
+/// Resolves what a nested `FOREACH v IN name` iterates: an enclosing loop
+/// element's children when `name` is a variable in scope, otherwise a group
+/// found inside the current element's subtree (staying inside the subtree is
+/// what keeps parallel planning of sibling elements safe).
+fn resolve_loop_source<'a>(
+    doc: &Document,
+    scopes: &[Scope],
+    inner: &'a Foreach,
+) -> Result<(NodeId, &'a str)> {
+    if let Some(idx) = lookup_scope(scopes, &inner.group) {
+        return Ok((scopes[idx].node, ""));
+    }
+    let current = scopes.last().expect("nested loop has an enclosing scope").node;
+    match doc.find_group_within(current, &inner.group) {
+        Some(id) => Ok((id, inner.group.as_str())),
+        None => Err(XsqlError::spanned(
             format!(
-                "unknown variable `{var}` (loop variable is `{}`, group is `{}`)",
-                foreach.var, foreach.group
+                "cannot iterate `{}`: not a variable in scope nor a group inside <{}>",
+                inner.group,
+                doc.node(current).tag
             ),
-            span,
-        ))
+            inner.span,
+        )),
     }
 }
 
-fn eval_expr(expr: &Expr, foreach: &Foreach, overlay: &Overlay) -> Result<Value> {
+fn eval_expr(doc: &Document, expr: &Expr, scopes: &[Scope]) -> Result<Value> {
     match expr {
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Num(n) => Ok(Value::Num(*n)),
         Expr::Attr { var, attr, span } => {
-            check_var(var, foreach, *span)?;
-            Ok(overlay.get(attr).map_or(Value::Null, Value::Str))
+            let idx = resolve_scope(scopes, var, *span)?;
+            Ok(scopes[idx].get(doc, attr).map_or(Value::Null, Value::Str))
         }
-        Expr::Not(inner, _) => Ok(Value::Bool(!eval_expr(inner, foreach, overlay)?.truthy())),
+        Expr::Not(inner, _) => Ok(Value::Bool(!eval_expr(doc, inner, scopes)?.truthy())),
         Expr::Neg(inner, span) => {
-            let value = eval_expr(inner, foreach, overlay)?;
+            let value = eval_expr(doc, inner, scopes)?;
             match value.as_num() {
                 Some(n) => Ok(Value::Num(-n)),
                 None => Err(XsqlError::spanned(
@@ -635,22 +909,22 @@ fn eval_expr(expr: &Expr, foreach: &Foreach, overlay: &Overlay) -> Result<Value>
         Expr::Binary { op, lhs, rhs, span } => {
             match op {
                 BinOp::And => {
-                    let l = eval_expr(lhs, foreach, overlay)?;
+                    let l = eval_expr(doc, lhs, scopes)?;
                     return Ok(Value::Bool(
-                        l.truthy() && eval_expr(rhs, foreach, overlay)?.truthy(),
+                        l.truthy() && eval_expr(doc, rhs, scopes)?.truthy(),
                     ));
                 }
                 BinOp::Or => {
-                    let l = eval_expr(lhs, foreach, overlay)?;
+                    let l = eval_expr(doc, lhs, scopes)?;
                     return Ok(Value::Bool(
-                        l.truthy() || eval_expr(rhs, foreach, overlay)?.truthy(),
+                        l.truthy() || eval_expr(doc, rhs, scopes)?.truthy(),
                     ));
                 }
                 _ => {}
             }
 
-            let l = eval_expr(lhs, foreach, overlay)?;
-            let r = eval_expr(rhs, foreach, overlay)?;
+            let l = eval_expr(doc, lhs, scopes)?;
+            let r = eval_expr(doc, rhs, scopes)?;
             let value = match op {
                 BinOp::Eq => Value::Bool(l.loose_eq(&r)),
                 BinOp::NotEq => Value::Bool(!l.loose_eq(&r)),

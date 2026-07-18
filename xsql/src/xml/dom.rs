@@ -92,6 +92,20 @@ impl Document {
         None
     }
 
+    /// Like [`Self::find_group`], but searches only the descendants of `root`
+    /// (used by nested FOREACH to stay inside the current element's subtree).
+    pub fn find_group_within(&self, root: NodeId, name: &str) -> Option<NodeId> {
+        let mut stack: Vec<NodeId> = self.node(root).children.iter().rev().copied().collect();
+        while let Some(id) = stack.pop() {
+            let el = self.node(id);
+            if el.tag == name || el.attr("name") == Some(name) || el.attr("id") == Some(name) {
+                return Some(id);
+            }
+            stack.extend(el.children.iter().rev());
+        }
+        None
+    }
+
     /// Detaches `id` from its parent (or from the root list).
     pub fn detach(&mut self, id: NodeId) {
         match self.nodes[id].parent {
@@ -112,6 +126,31 @@ impl Document {
         }
         self.nodes[parent].children.extend(&roots);
         roots
+    }
+
+    /// Deep-copies the subtree rooted at `src_id` of `src` into `self` as the
+    /// last child of `parent` (`src` is left untouched, unlike [`Self::graft`]).
+    /// Returns the new subtree root's id.
+    pub fn copy_subtree(&mut self, src: &Document, src_id: NodeId, parent: NodeId) -> NodeId {
+        let id = self.copy_rec(src, src_id, parent);
+        self.nodes[parent].children.push(id);
+        id
+    }
+
+    fn copy_rec(&mut self, src: &Document, src_id: NodeId, parent: NodeId) -> NodeId {
+        let src_el = src.node(src_id);
+        let id = self.push(Element {
+            tag: src_el.tag.clone(),
+            attrs: src_el.attrs.clone(),
+            children: Vec::new(),
+            text: src_el.text.clone(),
+            parent: Some(parent),
+        });
+        for &child in &src_el.children {
+            let new_child = self.copy_rec(src, child, id);
+            self.nodes[id].children.push(new_child);
+        }
+        id
     }
 }
 

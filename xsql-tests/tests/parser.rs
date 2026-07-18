@@ -100,6 +100,68 @@ fn insert_and_delete_group() {
 }
 
 #[test]
+fn merge_into_group_parses() {
+    let script =
+        parse("USE db.xml\nMERGE INTO GROUP goods RAW XML `<a id=\"1\"/>`;").unwrap();
+    assert!(
+        matches!(&script.blocks[0].verb, Verb::MergeInto { group, xml, .. } if group == "goods" && xml.contains("<a"))
+    );
+}
+
+#[test]
+fn nested_foreach_and_merge_attr_parse() {
+    let script = parse(
+        "USE db.xml\nFOREACH office IN offices\n    WHERE office.id = 1\n    FOREACH s IN office\n        MERGE s.tier = 1\n;",
+    )
+    .unwrap();
+    let Verb::Foreach(outer) = &script.blocks[0].verb else { panic!() };
+    assert!(matches!(&outer.ops[0], Op::Where(_)));
+    let Op::Foreach(inner) = &outer.ops[1] else { panic!("expected nested FOREACH") };
+    assert_eq!(inner.var, "s");
+    assert_eq!(inner.group, "office");
+    assert!(matches!(&inner.ops[0], Op::Merge { var, attr, .. } if var == "s" && attr == "tier"));
+}
+
+#[test]
+fn where_required_parses_attr_and_condition() {
+    let script =
+        parse("USE db.xml FOREACH a IN g WHERE REQUIRED a.cost > 100;").unwrap();
+    let Verb::Foreach(f) = &script.blocks[0].verb else { panic!() };
+    let Op::WhereRequired { var, attr, expr, .. } = &f.ops[0] else {
+        panic!("expected WHERE REQUIRED")
+    };
+    assert_eq!(var, "a");
+    assert_eq!(attr, "cost");
+    // The attribute doubles as the condition's lhs.
+    assert!(format!("{expr:?}").contains("Gt"), "{expr:?}");
+}
+
+#[test]
+fn output_op_parses_star_list_and_alias() {
+    let script = parse(
+        "USE db.xml\nFOREACH g IN goods OUTPUT g.id, g.cost * 2 AS double, level;\nSELECT GROUP goods OUTPUT *;",
+    )
+    .unwrap();
+    let Verb::Foreach(f) = &script.blocks[0].verb else { panic!() };
+    let Op::Output { all: false, items, .. } = &f.ops[0] else { panic!("expected OUTPUT") };
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].1, "id");
+    assert_eq!(items[1].1, "double");
+    assert_eq!(items[2].1, "level");
+
+    // `SELECT GROUP g OUTPUT ...` synthesizes an implicit loop.
+    let Verb::Select { foreach: Some(f), .. } = &script.blocks[1].verb else { panic!() };
+    assert_eq!(f.var, "goods");
+    assert!(matches!(&f.ops[0], Op::Output { all: true, .. }));
+}
+
+#[test]
+fn output_expression_without_alias_is_an_error() {
+    let err = parse("USE db.xml FOREACH g IN goods OUTPUT g.cost * 2;").unwrap_err();
+    assert!(err.message.contains("AS"), "{}", err.message);
+}
+
+#[test]
 fn numeric_and_quoted_group_names() {
     let script = parse(
         "USE db.xml\nSELECT GROUP 110000 FOREACH item IN 110000 WHERE item.id < 5;\nSELECT GROUP \"Group\";",

@@ -33,3 +33,40 @@ FOREACH office IN office
     SET office.name = "New Office Name"
     BREAK;
 ;
+
+; upsert (idempotent): entries matched by id get the cited attributes
+; updated (the rest preserved); unmatched entries are inserted
+MERGE INTO GROUP goods
+RAW XML `
+<ItemSpec id="52034301" cost="600"/>
+<ItemSpec id="52034999" level="9" cost="9000"/>
+`;
+
+; add an attribute only where it is missing — existing values win
+FOREACH good IN goods
+    MERGE good.level = 0
+;
+
+; WHERE REQUIRED: the attribute is mandatory — an element without it
+; aborts with an error (plain WHERE would skip it silently)
+SELECT GROUP goods
+FOREACH good IN goods
+    WHERE REQUIRED level >= 2
+;
+
+; nested FOREACH: iterate every group of the database, then every item
+; inside it (the inner loop can also read/write outer variables)
+FOREACH grp IN database
+    FOREACH item IN grp
+        MERGE item.checked = 1
+;
+
+; OUTPUT picks the printed attributes (OUTPUT * = whole element, the default)
+SELECT GROUP goods
+FOREACH good IN goods
+    WHERE good.cost > 500
+    OUTPUT good.id, good.cost, good.cost * 2 AS double_cost
+;
+
+; without FOREACH the loop is implicit
+SELECT GROUP arms OUTPUT id, cost;

@@ -108,6 +108,12 @@ fn serialize_node(doc: &Document, id: NodeId, depth: usize, pretty: bool, out: &
     }
 }
 
+/// Escapes `value` for use inside a double-quoted attribute (used by the
+/// OUTPUT projection, which renders elements outside this serializer).
+pub fn escape_attr_into(value: &str, out: &mut String) {
+    escape_into(value, true, out);
+}
+
 fn escape_into(value: &str, in_attr: bool, out: &mut String) {
     for ch in value.chars() {
         match ch {

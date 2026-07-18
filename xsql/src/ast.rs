@@ -98,6 +98,11 @@ pub enum Verb {
     ReplaceGroup { group: String, xml: String, xml_span: Span },
     /// `INSERT INTO GROUP name RAW XML `...`` — appends children.
     InsertInto { group: String, xml: String, xml_span: Span },
+    /// `MERGE INTO GROUP name RAW XML `...`` — upsert: each fragment element
+    /// is matched against the group's children (by `id`, then `name`, then
+    /// tag); matched elements get the cited attributes written over them
+    /// (other attributes preserved), unmatched elements are inserted.
+    MergeInto { group: String, xml: String, xml_span: Span },
     /// `DELETE [IGNORE] GROUP name` — removes the whole group element.
     DeleteGroup { group: String, ignore: bool },
     /// Bare mutation loop.
@@ -116,7 +121,25 @@ pub struct Foreach {
 pub enum Op {
     /// Guard: when false, remaining ops are skipped for this element.
     Where(Expr),
+    /// `WHERE REQUIRED attr <cond>` — every element must carry `attr`: a
+    /// missing attribute is a hard error (plain WHERE silently skips such
+    /// elements, since missing attributes evaluate as null); present
+    /// attributes evaluate `expr` as a normal guard.
+    WhereRequired {
+        var: String,
+        attr: String,
+        expr: Expr,
+        span: Span,
+    },
     Set {
+        var: String,
+        attr: String,
+        value: Expr,
+        span: Span,
+    },
+    /// `MERGE var.attr = expr` — writes the attribute only when it is
+    /// missing; an existing value wins, even when different (idempotent).
+    Merge {
         var: String,
         attr: String,
         value: Expr,
@@ -134,6 +157,19 @@ pub enum Op {
         span: Span,
     },
     Break,
+    /// Nested loop: `IN` names an enclosing loop variable (iterates that
+    /// element's children) or a group found inside the current element.
+    Foreach(Box<Foreach>),
+    /// `OUTPUT *` or `OUTPUT expr [AS name], ...` — emission point: when
+    /// execution reaches it, prints the current element in full (`*`, which
+    /// is also what a SELECT without OUTPUT does) or a flat element carrying
+    /// only the cited attributes/expressions. Each item's name defaults to
+    /// the attribute name; non-attribute expressions require `AS`.
+    Output {
+        all: bool,
+        items: Vec<(Expr, String)>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]

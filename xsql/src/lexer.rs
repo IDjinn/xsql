@@ -30,6 +30,7 @@ pub enum Tok {
     Slash,
     LParen,
     RParen,
+    Comma,
 
     Use,
     Input,
@@ -47,6 +48,10 @@ pub enum Tok {
     Ignore,
     Break,
     Into,
+    Merge,
+    Required,
+    Output,
+    As,
     And,
     Or,
     Not,
@@ -245,6 +250,10 @@ impl<'a> Lexer<'a> {
             "IGNORE" => Tok::Ignore,
             "BREAK" => Tok::Break,
             "INTO" => Tok::Into,
+            "MERGE" => Tok::Merge,
+            "REQUIRED" => Tok::Required,
+            "OUTPUT" => Tok::Output,
+            "AS" => Tok::As,
             "AND" => Tok::And,
             "OR" => Tok::Or,
             "NOT" => Tok::Not,
@@ -291,6 +300,7 @@ impl<'a> Lexer<'a> {
             '/' => Tok::Slash,
             '(' => Tok::LParen,
             ')' => Tok::RParen,
+            ',' => Tok::Comma,
             other => {
                 return Err(XsqlError::spanned(
                     format!("unexpected character `{other}`"),

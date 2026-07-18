@@ -57,11 +57,58 @@ FOREACH good IN goods
     WHERE goods.id > 52034301
 ;
 
+; OUTPUT picks which attributes are printed (like SQL's column list);
+; without OUTPUT the whole element prints — `OUTPUT *` is the implicit default
+SELECT GROUP goods
+FOREACH good IN goods
+    WHERE good.cost > 500
+    OUTPUT good.id, good.cost, good.cost * 2 AS double_cost
+;
+SELECT GROUP goods OUTPUT id, level;    without FOREACH: loops implicitly
+
+; OUTPUT in a nested loop joins scopes into one flat row
+FOREACH office IN offices
+    FOREACH member IN office
+        WHERE member.cost > 5
+        OUTPUT office.id AS office, member.name, member.cost
+;
+
 ; edit exactly one element
 FOREACH office IN office
     WHERE office.id = 216000
     SET office.name = "New Office Name"
     BREAK;
+;
+
+; upsert (idempotent): match children by id (then name, then tag);
+; matched -> cited attributes updated, the rest preserved; no match -> inserted
+MERGE INTO GROUP goods
+RAW XML `
+<ItemSpec id="52034301" cost="600"/>
+<ItemSpec id="52034999" level="9" cost="9000"/>
+`;
+
+; add an attribute only where missing — existing values win, even different ones
+FOREACH arm IN arms
+    MERGE arm.tier = 1
+;
+
+; WHERE works on any attribute; a missing attribute evaluates as null,
+; so the element is silently skipped. WHERE REQUIRED makes the attribute
+; mandatory instead: an element without it aborts the run with an error.
+SELECT GROUP goods
+FOREACH good IN goods
+    WHERE REQUIRED level >= 2
+;
+
+; nested FOREACH: iterate the current element's children (IN <outer var>),
+; or a group found inside the current element (IN <subgroup name>);
+; inner loops can read and write outer scopes (office.total below)
+FOREACH office IN offices
+    WHERE office.id = 216000
+    FOREACH member IN office
+        SET member.reviewed = 1
+        SET office.total = office.total + member.cost
 ;
 
 ; more verbs
@@ -82,10 +129,16 @@ ANALYZE;                   print per-stage timings to stderr
 | `SELECT GROUP g [FOREACH ...]` | prints the group, or the elements passing the loop's `WHERE`s |
 | `REPLACE GROUP g RAW XML \`...\`` | replaces the group's children with the fragment |
 | `INSERT INTO GROUP g RAW XML \`...\`` | appends the fragment to the group |
+| `MERGE INTO GROUP g RAW XML \`...\`` | upsert (idempotent): matches children by `id`, then `name`, then tag; matched → cited attributes updated (rest preserved; fragment children, when present, replace the existing ones), unmatched → inserted |
 | `DELETE [IGNORE] GROUP g` | removes the whole group element |
 | `FOREACH v IN g <ops>` | iterates the group's direct children |
-| `WHERE <expr>` | guard: skips remaining ops for non-matching elements |
+| `FOREACH v2 IN v <ops>` (nested) | iterates the current element's children (`v` = an enclosing loop variable) or a group found inside the current element; ops after a nested loop belong to it, and a `BREAK` inside it only ends the inner loop |
+| `WHERE <expr>` | guard: skips remaining ops for non-matching elements (a missing attribute participates as null) |
+| `WHERE REQUIRED attr <cond>` | like WHERE, but the attribute is mandatory: an element without it is a hard error (plain WHERE skips it silently) |
 | `SET v.attr = <expr>` | writes an attribute |
+| `MERGE v.attr = <expr>` | writes the attribute only when missing; an existing value wins, even a different one (idempotent) |
+| `OUTPUT <expr> [AS name], ...` | emission point: prints a flat element with only the cited attributes/expressions, evaluated when execution reaches it (missing attributes are omitted; non-attribute expressions need `AS`); works in SELECT loops, plain FOREACH loops and nested loops (mixing scopes into one row) |
+| `OUTPUT *` | prints the whole current element — the implicit default of a SELECT loop without OUTPUT |
 | `DELETE [IGNORE] v.attr` | removes an attribute (`IGNORE`: no error if absent) |
 | `DELETE v` | removes the current element |
 | `BREAK` | stops the loop |
@@ -105,7 +158,9 @@ the given name. Group names may be identifiers (`arms`), numbers
 (`SELECT GROUP 110000` — matches `<Group id="110000">`), or quoted strings
 (`SELECT GROUP "Group"` — for names that collide with keywords). Inside a loop, the loop variable, the group name and a bare
 attribute name all refer to the current element (`good.id`, `goods.id` and
-`id` are interchangeable).
+`id` are interchangeable). In nested loops the enclosing variables stay
+visible — the innermost binding wins — so an inner loop can read and write
+attributes of its outer elements.
 
 Expressions: `= != <> < > <= >= AND OR NOT + - * /`, numbers, `"strings"`,
 attribute references. Values are dynamically typed — numeric semantics apply

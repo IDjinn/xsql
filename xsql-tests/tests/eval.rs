@@ -240,6 +240,223 @@ fn session_without_stdin_rejects_use_input() {
     assert!(err.message.contains("USE INPUT"), "{}", err.message);
 }
 
+#[test]
+fn nested_foreach_iterates_children_of_outer_element() {
+    let xml = r#"<db><offices><Office id="1"><Staff id="a" cost="1"/><Staff id="b" cost="2"/></Office><Office id="2"><Staff id="c" cost="3"/></Office></offices></db>"#;
+    let script = parse(
+        "USE INPUT\nFOREACH office IN offices\n    WHERE office.id = 1\n    FOREACH s IN office\n        SET s.cost = s.cost * 10\n;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert!(out.contains(r#"<Staff id="a" cost="10"/>"#), "{out}");
+    assert!(out.contains(r#"<Staff id="b" cost="20"/>"#), "{out}");
+    // The other office's children are untouched.
+    assert!(out.contains(r#"<Staff id="c" cost="3"/>"#), "{out}");
+}
+
+#[test]
+fn nested_foreach_reads_and_writes_outer_scope() {
+    let xml = r#"<db><offices><Office id="1" total="0"><Staff cost="1"/><Staff cost="2"/></Office><Office id="2" total="0"><Staff cost="5"/></Office></offices></db>"#;
+    let script = parse(
+        "USE INPUT\nFOREACH office IN offices\n    FOREACH s IN office\n        SET office.total = office.total + s.cost\n        SET s.from = office.id\n;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    // Inner iterations accumulate into the outer element's attribute.
+    assert!(out.contains(r#"<Office id="1" total="3">"#), "{out}");
+    assert!(out.contains(r#"<Office id="2" total="5">"#), "{out}");
+    // Inner elements can read outer attributes.
+    assert!(out.contains(r#"<Staff cost="1" from="1"/>"#), "{out}");
+    assert!(out.contains(r#"<Staff cost="5" from="2"/>"#), "{out}");
+}
+
+#[test]
+fn nested_foreach_over_subgroup_inside_current_element() {
+    let xml = r#"<db><offices><Office id="1"><staff><P id="x" c="1"/></staff></Office></offices></db>"#;
+    let script = parse(
+        "USE INPUT\nFOREACH office IN offices\n    FOREACH p IN staff\n        SET p.c = 9\n;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert!(out.contains(r#"<P id="x" c="9"/>"#), "{out}");
+}
+
+#[test]
+fn nested_break_only_stops_inner_loop() {
+    let xml = r#"<db><offices><Office id="1"><S n="1"/><S n="2"/></Office><Office id="2"><S n="3"/><S n="4"/></Office></offices></db>"#;
+    let script = parse(
+        "USE INPUT\nFOREACH office IN offices\n    FOREACH s IN office\n        SET s.hit = 1\n        BREAK;\n;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    // First child of EACH office got hit: the outer loop kept going.
+    assert!(out.contains(r#"<S n="1" hit="1"/>"#), "{out}");
+    assert!(out.contains(r#"<S n="2"/>"#), "{out}");
+    assert!(out.contains(r#"<S n="3" hit="1"/>"#), "{out}");
+    assert!(out.contains(r#"<S n="4"/>"#), "{out}");
+}
+
+#[test]
+fn nested_foreach_unknown_source_errors() {
+    let xml = r#"<db><offices><Office id="1"/></offices></db>"#;
+    let script =
+        parse("USE INPUT\nFOREACH office IN offices\n    FOREACH x IN nope\n        SET x.a = 1\n;")
+            .unwrap();
+    let err = run(&script, Some(xml.to_string())).unwrap_err();
+    assert!(err.message.contains("cannot iterate `nope`"), "{}", err.message);
+}
+
+#[test]
+fn merge_into_updates_cited_attrs_and_inserts_new() {
+    let out = run_on_fixture(
+        "MERGE INTO GROUP goods RAW XML `<ItemSpec id=\"52034301\" cost=\"777\" extra=\"1\"/><ItemSpec id=\"999\" cost=\"5\"/>`;",
+    );
+    // Matched by id: cited attrs updated, the rest (level) preserved.
+    assert!(out.contains(r#"<ItemSpec id="52034301" level="1" cost="777" extra="1"/>"#), "{out}");
+    // No match: inserted.
+    assert!(out.contains(r#"<ItemSpec id="999" cost="5"/>"#), "{out}");
+    // Untouched sibling survives.
+    assert!(out.contains(r#"id="52034302""#), "{out}");
+}
+
+#[test]
+fn merge_into_is_idempotent() {
+    // Fragment matches the existing element exactly: nothing changes, so the
+    // document is not re-emitted.
+    let out = run_on_fixture(
+        "MERGE INTO GROUP goods RAW XML `<ItemSpec id=\"52034301\" level=\"1\" cost=\"500\"/>`;",
+    );
+    assert_eq!(out, "", "{out}");
+}
+
+#[test]
+fn merge_into_matches_by_name_then_tag() {
+    let xml = r#"<db><cfg><opt name="speed" v="1"/><misc v="2"/></cfg></db>"#;
+    let script = parse(
+        "USE INPUT\nMERGE INTO GROUP cfg RAW XML `<opt name=\"speed\" v=\"9\"/><misc v=\"3\"/><opt name=\"new\" v=\"0\"/>`;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert!(out.contains(r#"<opt name="speed" v="9"/>"#), "{out}");
+    assert!(out.contains(r#"<misc v="3"/>"#), "{out}");
+    assert!(out.contains(r#"<opt name="new" v="0"/>"#), "{out}");
+}
+
+#[test]
+fn merge_attr_only_writes_missing() {
+    // 101/102 already have science (kept, even though the value differs);
+    // 103 lacks it and gets the merged value.
+    let out = run_on_fixture("FOREACH arm IN arms MERGE arm.science = 99;");
+    assert!(out.contains(r#"id="101" cost="500" science="1""#), "{out}");
+    assert!(out.contains(r#"id="102" cost="900" science="3""#), "{out}");
+    assert!(out.contains(r#"id="103" cost="1200" unlock_civi_science="5" science="99""#), "{out}");
+}
+
+#[test]
+fn where_required_errors_when_attr_missing() {
+    // 103 has no science attribute: REQUIRED makes that a hard error
+    // (plain WHERE would just treat it as null and skip the element).
+    let script = parse(&format!(
+        "USE {}\nSELECT GROUP arms FOREACH arm IN arms WHERE REQUIRED arm.science > 0;",
+        fixture_path()
+    ))
+    .unwrap();
+    let err = run(&script, None).unwrap_err();
+    assert!(err.message.contains("`science` is REQUIRED"), "{}", err.message);
+    assert!(err.message.contains("<ItemSpec>"), "{}", err.message);
+}
+
+#[test]
+fn where_required_filters_normally_when_attr_present() {
+    // Every good has `level`, so REQUIRED behaves like a plain WHERE.
+    let out = run_on_fixture(
+        "SELECT GROUP goods FOREACH good IN goods WHERE REQUIRED good.level >= 2;",
+    );
+    assert!(!out.contains(r#"id="52034301""#), "{out}");
+    assert!(out.contains(r#"id="52034302""#), "{out}");
+    assert!(out.contains(r#"id="52034307""#), "{out}");
+}
+
+#[test]
+fn attribute_ops_apply_in_script_order() {
+    // DELETE then SET must leave the attribute present (script order), not
+    // batch all SETs before all DELETEs.
+    let out = run_on_fixture(
+        "FOREACH good IN goods WHERE good.id = 52034301 DELETE good.cost SET good.cost = 42;",
+    );
+    assert!(out.contains(r#"<ItemSpec id="52034301" level="1" cost="42"/>"#), "{out}");
+}
+
+#[test]
+fn output_projects_cited_attrs_only() {
+    let out = run_on_fixture(
+        "SELECT GROUP goods\nFOREACH good IN goods\n    WHERE good.id > 52034301\n    OUTPUT good.id, good.cost\n;",
+    );
+    assert!(out.contains(r#"<ItemSpec id="52034302" cost="1000"/>"#), "{out}");
+    assert!(out.contains(r#"<ItemSpec id="52034307" cost="4000"/>"#), "{out}");
+    // Uncited attribute and unmatched element are absent; query only.
+    assert!(!out.contains("level="), "{out}");
+    assert!(!out.contains(r#"id="52034301""#), "{out}");
+    assert!(!out.contains("<database>"), "{out}");
+}
+
+#[test]
+fn output_star_matches_select_default() {
+    let plain = run_on_fixture("SELECT GROUP goods FOREACH good IN goods WHERE good.id > 52034301;");
+    let star = run_on_fixture(
+        "SELECT GROUP goods FOREACH good IN goods WHERE good.id > 52034301 OUTPUT *;",
+    );
+    assert_eq!(plain, star);
+}
+
+#[test]
+fn output_without_foreach_loops_implicitly() {
+    let out = run_on_fixture("SELECT GROUP goods OUTPUT id, level;");
+    assert!(out.contains(r#"<ItemSpec id="52034301" level="1"/>"#), "{out}");
+    assert!(out.contains(r#"<ItemSpec id="52034302" level="2"/>"#), "{out}");
+    assert!(out.contains(r#"<ItemSpec id="52034307" level="7"/>"#), "{out}");
+}
+
+#[test]
+fn output_expression_with_alias() {
+    let out = run_on_fixture(
+        "SELECT GROUP goods\nFOREACH good IN goods\n    WHERE good.id = 52034301\n    OUTPUT good.id, good.cost * 2 AS double_cost\n;",
+    );
+    assert!(out.contains(r#"<ItemSpec id="52034301" double_cost="1000"/>"#), "{out}");
+}
+
+#[test]
+fn output_omits_missing_attrs() {
+    // 103 has no science attribute: the projection just leaves it out.
+    let out = run_on_fixture("SELECT GROUP arms OUTPUT id, science;");
+    assert!(out.contains(r#"<ItemSpec id="101" science="1"/>"#), "{out}");
+    assert!(out.contains(r#"<ItemSpec id="103"/>"#), "{out}");
+}
+
+#[test]
+fn output_sees_prior_sets_not_later_ones() {
+    let out = run_on_fixture(
+        "FOREACH good IN goods\n    WHERE good.id = 52034301\n    SET good.cost = 111\n    OUTPUT good.id, good.cost\n    SET good.cost = 222\n;",
+    );
+    // Emission snapshots the overlay at reach time.
+    assert!(out.contains(r#"<ItemSpec id="52034301" cost="111"/>"#), "{out}");
+    // The document itself ends up with the later SET.
+    assert!(out.contains(r#"<ItemSpec id="52034301" level="1" cost="222"/>"#), "{out}");
+}
+
+#[test]
+fn output_in_nested_loop_joins_scopes() {
+    let xml = r#"<db><offices><Office id="1"><S name="a" cost="9"/><S name="b" cost="1"/></Office><Office id="2"><S name="c" cost="7"/></Office></offices></db>"#;
+    let script = parse(
+        "USE INPUT\nSELECT GROUP offices\nFOREACH office IN offices\n    FOREACH s IN office\n        WHERE s.cost > 5\n        OUTPUT office.id AS office, s.name, s.cost\n;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert!(out.contains(r#"<S office="1" name="a" cost="9"/>"#), "{out}");
+    assert!(out.contains(r#"<S office="2" name="c" cost="7"/>"#), "{out}");
+    assert!(!out.contains(r#"name="b""#), "{out}");
+}
+
 /// Large group exercises the parallel evaluate-then-apply FOREACH path
 /// (threshold is 1024 children); result must match sequential semantics.
 #[test]
