@@ -479,3 +479,139 @@ fn parallel_foreach_matches_sequential_semantics() {
     assert!(out.contains(r#"<Item id="50000" cost="500005"/>"#));
     assert!(out.contains(&format!(r#"<Item id="{}" cost="{}"/>"#, n - 1, (n - 1) * 10 + 5)));
 }
+
+// ---------------------------------------------------------------------------
+// MySQL-style shorthands (UPDATE / MERGE ... SET / DELETE FROM)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_edits_matching_element() {
+    let out = run_on_fixture(
+        "UPDATE office SET name = \"New Office Name\" WHERE office.id = 216000 LIMIT 1;",
+    );
+    assert!(out.contains(r#"name="New Office Name""#), "{out}");
+    assert!(out.contains(r#"name="Other Office""#), "{out}");
+}
+
+#[test]
+fn update_without_where_edits_all() {
+    let out = run_on_fixture("UPDATE goods SET level = 9;");
+    assert_eq!(out.matches(r#"level="9""#).count(), 3, "{out}");
+}
+
+#[test]
+fn update_multiple_assignments_and_expressions() {
+    let out = run_on_fixture("UPDATE goods SET cost = cost * 2, tag2 = \"x\" WHERE id = 52034301;");
+    assert!(out.contains(r#"id="52034301" level="1" cost="1000" tag2="x""#), "{out}");
+    assert!(out.contains(r#"id="52034302" level="2" cost="1000"/>"#), "{out}");
+}
+
+#[test]
+fn merge_shorthand_writes_only_missing() {
+    // 101 and 102 already carry science; only 103 gets the merged value.
+    let out = run_on_fixture("MERGE arms SET science = 99;");
+    assert!(out.contains(r#"id="101" cost="500" science="1""#), "{out}");
+    assert!(out.contains(r#"id="103" cost="1200" unlock_civi_science="5" science="99""#), "{out}");
+}
+
+#[test]
+fn delete_from_removes_matching_elements() {
+    let out = run_on_fixture("DELETE FROM goods WHERE cost > 500;");
+    assert!(out.contains(r#"id="52034301""#), "{out}");
+    assert!(!out.contains(r#"id="52034302""#), "{out}");
+    assert!(!out.contains(r#"id="52034307""#), "{out}");
+    // The container survives.
+    assert!(out.contains("<goods>"), "{out}");
+}
+
+#[test]
+fn delete_from_limit_one_stops_after_first_match() {
+    let out = run_on_fixture("DELETE FROM goods WHERE cost >= 1000 LIMIT 1;");
+    assert!(!out.contains(r#"id="52034302""#), "{out}");
+    assert!(out.contains(r#"id="52034307""#), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// TAG selectors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn select_tag_prints_all_matches_across_groups() {
+    let out = run_on_fixture("SELECT TAG ItemSpec;");
+    // arms(3) + goods(3) + new_continued_cost(1), no container tags.
+    assert_eq!(out.matches("<ItemSpec").count(), 7, "{out}");
+    assert!(!out.contains("<arms"), "{out}");
+    assert!(!out.contains("<OfficeSpec"), "{out}");
+}
+
+#[test]
+fn foreach_in_tag_iterates_document_wide() {
+    let out = run_on_fixture("FOREACH i IN TAG ItemSpec SET i.seen = 1;");
+    assert_eq!(out.matches(r#"seen="1""#).count(), 7, "{out}");
+    assert!(!out.contains(r#"<OfficeSpec id="216000" name="Old Office" seen"#), "{out}");
+}
+
+#[test]
+fn update_tag_with_where() {
+    let out = run_on_fixture("UPDATE TAG ItemSpec SET cheap = 1 WHERE cost < 600;");
+    // cost 500 in arms, cost 500 in goods, cost 1 in new_continued_cost.
+    assert_eq!(out.matches(r#"cheap="1""#).count(), 3, "{out}");
+}
+
+#[test]
+fn delete_tag_removes_every_match() {
+    let out = run_on_fixture("DELETE TAG ItemSpec;");
+    assert!(!out.contains("<ItemSpec"), "{out}");
+    assert!(out.contains("<arms/>"), "{out}");
+    assert!(out.contains("<OfficeSpec"), "{out}");
+}
+
+#[test]
+fn delete_missing_tag_errors_without_ignore() {
+    let script = parse(&format!("USE {}\nDELETE TAG Nope;", fixture_path())).unwrap();
+    let err = run(&script, None).unwrap_err();
+    assert!(err.message.contains("no element with tag `Nope`"), "{}", err.message);
+    // With IGNORE it is a no-op.
+    let out = run_on_fixture("DELETE IGNORE TAG Nope;");
+    assert_eq!(out, "");
+}
+
+#[test]
+fn select_missing_tag_errors() {
+    let script = parse(&format!("USE {}\nSELECT TAG Nope;", fixture_path())).unwrap();
+    let err = run(&script, None).unwrap_err();
+    assert!(err.message.contains("no element with tag `Nope`"), "{}", err.message);
+}
+
+#[test]
+fn nested_foreach_in_tag_stays_within_subtree() {
+    let xml = r#"<db><a><wrap><Item v="1"/></wrap><Item v="2"/></a><b><Item v="3"/></b></db>"#;
+    let script = parse(
+        "USE INPUT\nFOREACH outer IN TAG a\n    FOREACH i IN TAG Item\n        SET i.hit = 1\n;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    // Both Items under <a> (nested at different depths) are hit; <b>'s is not.
+    assert_eq!(out.matches(r#"hit="1""#).count(), 2, "{out}");
+    assert!(out.contains(r#"<Item v="3"/>"#), "{out}");
+}
+
+#[test]
+fn select_tag_with_output_projection() {
+    let out = run_on_fixture("SELECT TAG OfficeSpec OUTPUT id, name;");
+    assert!(out.contains(r#"<OfficeSpec id="216000" name="Old Office"/>"#), "{out}");
+    assert!(out.contains(r#"<OfficeSpec id="216001" name="Other Office"/>"#), "{out}");
+}
+
+/// Nested tag matches (an element whose tag also appears in its descendants)
+/// must keep sequential semantics: the outer element's write is visible when
+/// the inner element is planned... and the loop stays correct either way.
+#[test]
+fn foreach_tag_handles_nested_matches() {
+    let xml = r#"<db><Item id="1"><Item id="2"/></Item></db>"#;
+    let script =
+        parse("USE INPUT\nFOREACH i IN TAG Item SET i.n = i.id + 10;").unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert!(out.contains(r#"<Item id="1" n="11">"#), "{out}");
+    assert!(out.contains(r#"<Item id="2" n="12"/>"#), "{out}");
+}

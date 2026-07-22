@@ -246,25 +246,24 @@ impl Parser {
         match self.peek().clone() {
             Tok::Select => {
                 self.bump();
-                self.expect(Tok::Group, "after SELECT")?;
-                let group = self.group_name()?;
+                let target = self.selector("after SELECT")?;
                 let foreach = if self.peek() == &Tok::Foreach {
                     Some(self.foreach()?)
                 } else if self.peek() == &Tok::Output {
-                    // `SELECT GROUP g OUTPUT ...` — implicit loop over the
-                    // group's children.
+                    // `SELECT GROUP g OUTPUT ...` / `SELECT TAG t OUTPUT ...`
+                    // — implicit loop over the selected elements.
                     let output_span = self.span();
                     let op = self.output_op()?;
                     Some(Foreach {
-                        var: group.clone(),
-                        group: group.clone(),
+                        var: target.name().to_string(),
+                        source: selector_source(&target),
                         ops: vec![op],
                         span: output_span,
                     })
                 } else {
                     None
                 };
-                Ok(Verb::Select { group, foreach })
+                Ok(Verb::Select { target, foreach })
             }
             Tok::Replace => {
                 self.bump();
@@ -283,25 +282,166 @@ impl Parser {
             }
             Tok::Merge => {
                 self.bump();
-                self.expect(Tok::Into, "after MERGE")?;
-                self.expect(Tok::Group, "after MERGE INTO")?;
-                let group = self.group_name()?;
-                let (xml, xml_span) = self.raw_xml()?;
-                Ok(Verb::MergeInto { group, xml, xml_span })
+                if self.peek() == &Tok::Into {
+                    self.bump();
+                    self.expect(Tok::Group, "after MERGE INTO")?;
+                    let group = self.group_name()?;
+                    let (xml, xml_span) = self.raw_xml()?;
+                    Ok(Verb::MergeInto { group, xml, xml_span })
+                } else {
+                    // `MERGE g SET a = e [WHERE ...]` — shorthand form.
+                    self.update_like(span, true)
+                }
+            }
+            Tok::Update => {
+                self.bump();
+                self.update_like(span, false)
             }
             Tok::Delete => {
                 self.bump();
                 let ignore = self.eat(&Tok::Ignore);
-                self.expect(Tok::Group, "after DELETE")?;
-                let group = self.group_name()?;
-                Ok(Verb::DeleteGroup { group, ignore })
+                match self.peek().clone() {
+                    Tok::From => {
+                        if ignore {
+                            return Err(XsqlError::spanned(
+                                "IGNORE is not supported with DELETE FROM \
+                                 (a WHERE that matches nothing simply deletes nothing)",
+                                span,
+                            ));
+                        }
+                        self.bump();
+                        self.delete_from(span)
+                    }
+                    Tok::Tag => {
+                        self.bump();
+                        Ok(Verb::DeleteTag { tag: self.group_name()?, ignore })
+                    }
+                    _ => {
+                        self.expect(Tok::Group, "after DELETE")?;
+                        let group = self.group_name()?;
+                        Ok(Verb::DeleteGroup { group, ignore })
+                    }
+                }
             }
             Tok::Foreach => Ok(Verb::Foreach(self.foreach()?)),
             other => Err(XsqlError::spanned(
                 format!(
-                    "expected SELECT, REPLACE, INSERT, MERGE, DELETE or FOREACH after USE, found {}",
+                    "expected SELECT, REPLACE, INSERT, MERGE, UPDATE, DELETE or FOREACH after USE, found {}",
                     other.describe()
                 ),
+                span,
+            )),
+        }
+    }
+
+    /// `GROUP <name>` or `TAG <name>`.
+    fn selector(&mut self, context: &str) -> Result<Selector> {
+        match self.peek() {
+            Tok::Group => {
+                self.bump();
+                Ok(Selector::Group(self.group_name()?))
+            }
+            Tok::Tag => {
+                self.bump();
+                Ok(Selector::Tag(self.group_name()?))
+            }
+            other => Err(XsqlError::spanned(
+                format!("expected GROUP or TAG {context}, found {}", other.describe()),
+                self.span(),
+            )),
+        }
+    }
+
+    /// Shorthand target: `TAG t` or `[GROUP] g` (the GROUP keyword is
+    /// optional, matching MySQL's bare table name).
+    fn shorthand_source(&mut self) -> Result<LoopSource> {
+        if self.eat(&Tok::Tag) {
+            Ok(LoopSource::Tag(self.group_name()?))
+        } else {
+            self.eat(&Tok::Group);
+            Ok(LoopSource::Name(self.group_name()?))
+        }
+    }
+
+    /// MySQL-style shorthand, the UPDATE / MERGE keyword already consumed:
+    /// `(TAG t | [GROUP] g) SET a = e (, b = e)* [WHERE expr] [LIMIT 1]`.
+    /// Desugars to a FOREACH: the WHERE guard first, then the writes
+    /// (`merge`: MERGE semantics — write only when missing); `LIMIT 1`
+    /// appends BREAK, stopping after the first matching element.
+    fn update_like(&mut self, span: Span, merge: bool) -> Result<Verb> {
+        let keyword = if merge { "MERGE" } else { "UPDATE" };
+        let source = self.shorthand_source()?;
+        let var = source.name().to_string();
+        self.expect(Tok::Set, &format!("after the {keyword} target"))?;
+        let mut writes = Vec::new();
+        loop {
+            let op_span = self.span();
+            let (target, target_span) = self.ident("as the assignment target")?;
+            let (avar, attr) = if target.contains('.') {
+                split_attr_ref(&target, target_span)?
+            } else {
+                (String::new(), target)
+            };
+            self.expect(Tok::Eq, "after the assignment target")?;
+            let value = self.expr()?;
+            writes.push(if merge {
+                Op::Merge { var: avar, attr, value, span: op_span }
+            } else {
+                Op::Set { var: avar, attr, value, span: op_span }
+            });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        let guard = if self.eat(&Tok::Where) {
+            Some(Op::Where(self.expr()?))
+        } else {
+            None
+        };
+        let limit_one = self.limit_one()?;
+        let mut ops = Vec::with_capacity(writes.len() + 2);
+        ops.extend(guard);
+        ops.append(&mut writes);
+        if limit_one {
+            ops.push(Op::Break);
+        }
+        Ok(Verb::Foreach(Foreach { var, source, ops, span }))
+    }
+
+    /// `DELETE FROM (TAG t | [GROUP] g) [WHERE expr] [LIMIT 1]` — removes the
+    /// matching elements (unlike `DELETE GROUP`, which removes the container).
+    fn delete_from(&mut self, span: Span) -> Result<Verb> {
+        let source = self.shorthand_source()?;
+        let var = source.name().to_string();
+        let guard = if self.eat(&Tok::Where) {
+            Some(Op::Where(self.expr()?))
+        } else {
+            None
+        };
+        let limit_one = self.limit_one()?;
+        let mut ops = Vec::with_capacity(3);
+        ops.extend(guard);
+        ops.push(Op::DeleteElem { var: var.clone(), ignore: true, span });
+        if limit_one {
+            ops.push(Op::Break);
+        }
+        Ok(Verb::Foreach(Foreach { var, source, ops, span }))
+    }
+
+    /// Optional `LIMIT 1` (any other limit is rejected — the engine only
+    /// supports stop-after-first-match).
+    fn limit_one(&mut self) -> Result<bool> {
+        if !self.eat(&Tok::Limit) {
+            return Ok(false);
+        }
+        let span = self.span();
+        match self.peek().clone() {
+            Tok::Num(n) if n == 1.0 => {
+                self.bump();
+                Ok(true)
+            }
+            other => Err(XsqlError::spanned(
+                format!("only LIMIT 1 is supported, found {}", other.describe()),
                 span,
             )),
         }
@@ -359,7 +499,11 @@ impl Parser {
             ));
         }
         self.expect(Tok::In, "after the loop variable")?;
-        let group = self.group_name()?;
+        let source = if self.eat(&Tok::Tag) {
+            LoopSource::Tag(self.group_name()?)
+        } else {
+            LoopSource::Name(self.group_name()?)
+        };
 
         let mut ops = Vec::new();
         loop {
@@ -439,7 +583,7 @@ impl Parser {
             }
         }
 
-        Ok(Foreach { var, group, ops, span })
+        Ok(Foreach { var, source, ops, span })
     }
 
     /// `OUTPUT *` | `OUTPUT expr [AS name] (, expr [AS name])*` — the caller
@@ -608,6 +752,13 @@ impl Parser {
                 span,
             )),
         }
+    }
+}
+
+fn selector_source(target: &Selector) -> LoopSource {
+    match target {
+        Selector::Group(name) => LoopSource::Name(name.clone()),
+        Selector::Tag(name) => LoopSource::Tag(name.clone()),
     }
 }
 

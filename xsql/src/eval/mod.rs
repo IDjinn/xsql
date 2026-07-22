@@ -12,7 +12,9 @@
 //!    sequential (a BREAK inside a nested FOREACH only ends that inner loop,
 //!    so it doesn't force sequential execution). Nested loops only ever
 //!    touch the current top-level child's subtree, which is what keeps the
-//!    parallel planning safe.
+//!    parallel planning safe. TAG-based loops may match nested elements;
+//!    they only run parallel after a disjointness check (no match is an
+//!    ancestor of another) — otherwise they stay sequential.
 //! 4. Modified documents are serialized in parallel and appended to the
 //!    output in first-use order.
 //!
@@ -27,11 +29,14 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
-use crate::ast::{BinOp, Block, Expr, Foreach, Op, Script, Settings, Source, Verb};
+use crate::ast::{BinOp, Block, Expr, Foreach, LoopSource, Op, Script, Selector, Settings, Source, Verb};
 use crate::error::{Result, Span, XsqlError};
 use crate::xml::dom::{Document, Element, NodeId};
+#[cfg(not(feature = "simd"))]
 use crate::xml::parse::{parse_document_opts, parse_fragment_opts};
-use crate::xml::serialize::{escape_attr_into, serialize_document_opts, serialize_subtree_opts};
+#[cfg(feature = "simd")]
+use crate::xml::parse_simd::{parse_document_opts, parse_fragment_opts};
+use crate::xml::serialize::{escape_attr_into, serialize_document_opts, serialize_subtree_into};
 
 use value::Value;
 
@@ -190,7 +195,9 @@ pub fn run_with_report(
     let serialize_time = serialize_start.elapsed();
 
     let assemble_start = Instant::now();
-    let mut out = String::new();
+    let capacity = selects.iter().map(|(_, text)| text.len()).sum::<usize>()
+        + serialized.iter().map(String::len).sum::<usize>();
+    let mut out = String::with_capacity(capacity);
     for (_, text) in selects {
         out.push_str(&text);
     }
@@ -233,7 +240,7 @@ fn verb_label(verb: &Verb) -> &'static str {
         Verb::ReplaceGroup { .. } => "REPLACE",
         Verb::InsertInto { .. } => "INSERT",
         Verb::MergeInto { .. } => "MERGE",
-        Verb::DeleteGroup { .. } => "DELETE",
+        Verb::DeleteGroup { .. } | Verb::DeleteTag { .. } => "DELETE",
         Verb::Foreach(_) => "FOREACH",
     }
 }
@@ -391,25 +398,34 @@ struct BlockResult {
 
 fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<BlockResult> {
     match &block.verb {
-        Verb::Select { group, foreach } => {
-            let group_id = resolve_group(doc, group, block)?;
+        Verb::Select { target, foreach } => {
             match foreach {
-                None => Ok(BlockResult {
-                    output: Some(serialize_subtree_opts(doc, group_id, settings.format)),
-                    modified: false,
-                }),
+                // `SELECT GROUP g` prints the group element itself;
+                // `SELECT TAG t` prints every matching element.
+                None => {
+                    let ids = match target {
+                        Selector::Group(group) => vec![resolve_group(doc, group, block)?],
+                        Selector::Tag(tag) => resolve_tags(doc, tag, block)?,
+                    };
+                    let mut text = String::new();
+                    for &id in &ids {
+                        serialize_subtree_into(doc, id, settings.format, &mut text);
+                    }
+                    Ok(BlockResult { output: Some(text), modified: false })
+                }
                 Some(foreach) => {
-                    let outcome = run_foreach(doc, group_id, foreach)?;
+                    let elements = select_elements(doc, target, block)?;
+                    let outcome = run_foreach(doc, elements, foreach)?;
                     // An OUTPUT op takes over what gets printed; without one
                     // the elements passing every WHERE print in full.
                     let text = if foreach_has_output(foreach) {
                         render_emits(doc, &outcome.emits, settings)
                     } else {
-                        outcome
-                            .selected
-                            .iter()
-                            .map(|&id| serialize_subtree_opts(doc, id, settings.format))
-                            .collect()
+                        let mut text = String::new();
+                        for &id in &outcome.selected {
+                            serialize_subtree_into(doc, id, settings.format, &mut text);
+                        }
+                        text
                     };
                     Ok(BlockResult {
                         output: Some(text),
@@ -419,8 +435,8 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
             }
         }
         Verb::Foreach(foreach) => {
-            let group_id = resolve_group(doc, &foreach.group, block)?;
-            let outcome = run_foreach(doc, group_id, foreach)?;
+            let elements = loop_elements(doc, &foreach.source, block)?;
+            let outcome = run_foreach(doc, elements, foreach)?;
             // A mutation loop with OUTPUT also prints its emissions.
             let output = foreach_has_output(foreach)
                 .then(|| render_emits(doc, &outcome.emits, settings));
@@ -461,11 +477,34 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
             None if *ignore => Ok(BlockResult { output: None, modified: false }),
             None => Err(group_not_found(group, block)),
         },
+        Verb::DeleteTag { tag, ignore } => {
+            let matches = doc.find_tags(tag);
+            if matches.is_empty() {
+                return if *ignore {
+                    Ok(BlockResult { output: None, modified: false })
+                } else {
+                    Err(tag_not_found(tag, block))
+                };
+            }
+            for id in matches {
+                doc.detach(id);
+            }
+            Ok(BlockResult { output: None, modified: true })
+        }
     }
 }
 
 fn resolve_group(doc: &Document, group: &str, block: &Block) -> Result<NodeId> {
     doc.find_group(group).ok_or_else(|| group_not_found(group, block))
+}
+
+fn resolve_tags(doc: &Document, tag: &str, block: &Block) -> Result<Vec<NodeId>> {
+    let matches = doc.find_tags(tag);
+    if matches.is_empty() {
+        Err(tag_not_found(tag, block))
+    } else {
+        Ok(matches)
+    }
 }
 
 fn group_not_found(group: &str, block: &Block) -> XsqlError {
@@ -476,6 +515,75 @@ fn group_not_found(group: &str, block: &Block) -> XsqlError {
         ),
         block.span,
     )
+}
+
+fn tag_not_found(tag: &str, block: &Block) -> XsqlError {
+    XsqlError::spanned(
+        format!("no element with tag `{tag}` in {}", block.source.describe()),
+        block.span,
+    )
+}
+
+/// The elements a top-level loop iterates. Group children are siblings, so
+/// their subtrees are disjoint and parallel planning is safe; tag matches can
+/// nest inside each other, so disjointness is only known after checking.
+struct LoopElems {
+    elems: Vec<NodeId>,
+    /// `true` when the subtrees are known disjoint (group children). Tag
+    /// matches are verified lazily in [`run_foreach`] only when the loop is
+    /// big enough for parallel evaluation to matter.
+    disjoint: bool,
+}
+
+fn loop_elements(doc: &Document, source: &LoopSource, block: &Block) -> Result<LoopElems> {
+    match source {
+        LoopSource::Name(group) => {
+            let group_id = resolve_group(doc, group, block)?;
+            Ok(LoopElems { elems: non_comment_children(doc, group_id), disjoint: true })
+        }
+        LoopSource::Tag(tag) => {
+            Ok(LoopElems { elems: resolve_tags(doc, tag, block)?, disjoint: false })
+        }
+    }
+}
+
+fn select_elements(doc: &Document, target: &Selector, block: &Block) -> Result<LoopElems> {
+    match target {
+        Selector::Group(group) => {
+            let group_id = resolve_group(doc, group, block)?;
+            Ok(LoopElems { elems: non_comment_children(doc, group_id), disjoint: true })
+        }
+        Selector::Tag(tag) => {
+            Ok(LoopElems { elems: resolve_tags(doc, tag, block)?, disjoint: false })
+        }
+    }
+}
+
+/// Comment nodes (IGNORE_COMMENTS = OFF) are not loop elements.
+fn non_comment_children(doc: &Document, parent: NodeId) -> Vec<NodeId> {
+    doc.node(parent)
+        .children
+        .iter()
+        .copied()
+        .filter(|&child| !doc.node(child).is_comment())
+        .collect()
+}
+
+/// Whether no element in `elems` is an ancestor of another — the condition
+/// for parallel evaluate-then-apply to preserve sequential semantics (a
+/// nested match would otherwise miss its ancestor's pending writes).
+fn elems_disjoint(doc: &Document, elems: &[NodeId]) -> bool {
+    let set: std::collections::HashSet<NodeId> = elems.iter().copied().collect();
+    elems.iter().all(|&id| {
+        let mut parent = doc.node(id).parent;
+        while let Some(p) = parent {
+            if set.contains(&p) {
+                return false;
+            }
+            parent = doc.node(p).parent;
+        }
+        true
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -599,26 +707,28 @@ fn render_emits(doc: &Document, emits: &[Emit], settings: &Settings) -> String {
     for emit in emits {
         match emit {
             Emit::Text(line) => text.push_str(line),
-            Emit::Node(id) => text.push_str(&serialize_subtree_opts(doc, *id, settings.format)),
+            Emit::Node(id) => serialize_subtree_into(doc, *id, settings.format, &mut text),
         }
     }
     text
 }
 
-fn run_foreach(doc: &mut Document, group_id: NodeId, foreach: &Foreach) -> Result<ForeachOutcome> {
-    // Comment nodes (IGNORE_COMMENTS = OFF) are not loop elements.
-    let children: Vec<NodeId> = doc
-        .node(group_id)
-        .children
-        .iter()
-        .copied()
-        .filter(|&child| !doc.node(child).is_comment())
-        .collect();
+fn run_foreach(
+    doc: &mut Document,
+    elements: LoopElems,
+    foreach: &Foreach,
+) -> Result<ForeachOutcome> {
+    let LoopElems { elems: children, disjoint } = elements;
     let has_break = foreach.ops.iter().any(|op| matches!(op, Op::Break));
 
     let mut outcome = ForeachOutcome { selected: Vec::new(), emits: Vec::new(), mutations: 0 };
 
-    if !has_break && children.len() >= PAR_FOREACH_THRESHOLD {
+    // Parallel planning requires disjoint subtrees; tag matches only get the
+    // (linear) ancestor check once the loop is big enough to parallelize.
+    let parallel = !has_break
+        && children.len() >= PAR_FOREACH_THRESHOLD
+        && (disjoint || elems_disjoint(doc, &children));
+    if parallel {
         // Parallel read-only evaluation, then sequential apply.
         let doc_ref: &Document = doc;
         let plans: Vec<ChildPlan> = children
@@ -718,8 +828,15 @@ fn plan_child(doc: &Document, child: NodeId, foreach: &Foreach) -> Result<ChildP
     let mut scopes = Vec::new();
     let mut actions = Vec::new();
     let mut emits = Vec::new();
-    let (selected, broke) =
-        plan_element(doc, child, foreach, &foreach.group, &mut scopes, &mut actions, &mut emits)?;
+    let (selected, broke) = plan_element(
+        doc,
+        child,
+        foreach,
+        foreach.source.name(),
+        &mut scopes,
+        &mut actions,
+        &mut emits,
+    )?;
     Ok(ChildPlan { selected, broke, actions, emits })
 }
 
@@ -749,7 +866,7 @@ fn plan_ops<'a>(
     emits: &mut Vec<Emit>,
 ) -> Result<(bool, bool)> {
     let mut selected = true;
-    for op in &foreach.ops {
+    for (op_idx, op) in foreach.ops.iter().enumerate() {
         match op {
             Op::Where(expr) => {
                 if !eval_expr(doc, expr, scopes)?.truthy() {
@@ -808,23 +925,21 @@ fn plan_ops<'a>(
             Op::DeleteElem { var, ignore: _, span } => {
                 let idx = resolve_scope(scopes, var, *span)?;
                 actions.push((scopes[idx].node, Action::DeleteElem));
-                // Deleting the current element ends its planning; deleting an
-                // enclosing element leaves this loop running over the
+                // Deleting the current element ends its planning (later ops
+                // would target a deleted element) — but a BREAK further down
+                // still stops the loop (`DELETE FROM ... LIMIT 1`). Deleting
+                // an enclosing element leaves this loop running over the
                 // (already snapshotted) children.
                 if idx == scopes.len() - 1 {
-                    break;
+                    let breaks = foreach.ops[op_idx + 1..]
+                        .iter()
+                        .any(|op| matches!(op, Op::Break));
+                    return Ok((selected, breaks));
                 }
             }
             Op::Break => return Ok((selected, true)),
             Op::Foreach(inner) => {
-                let (parent, inner_alias) = resolve_loop_source(doc, scopes, inner)?;
-                let kids: Vec<NodeId> = doc
-                    .node(parent)
-                    .children
-                    .iter()
-                    .copied()
-                    .filter(|&kid| !doc.node(kid).is_comment())
-                    .collect();
+                let (kids, inner_alias) = resolve_loop_elems(doc, scopes, inner)?;
                 for kid in kids {
                     let (_, broke) =
                         plan_element(doc, kid, inner, inner_alias, scopes, actions, emits)?;
@@ -864,26 +979,33 @@ fn plan_ops<'a>(
 /// Resolves what a nested `FOREACH v IN name` iterates: an enclosing loop
 /// element's children when `name` is a variable in scope, otherwise a group
 /// found inside the current element's subtree (staying inside the subtree is
-/// what keeps parallel planning of sibling elements safe).
-fn resolve_loop_source<'a>(
+/// what keeps parallel planning of sibling elements safe). `IN TAG t`
+/// iterates every element with tag `t` inside the current element's subtree
+/// (zero matches simply iterate nothing — heterogeneous documents are the
+/// whole point of TAG).
+fn resolve_loop_elems<'a>(
     doc: &Document,
     scopes: &[Scope],
     inner: &'a Foreach,
-) -> Result<(NodeId, &'a str)> {
-    if let Some(idx) = lookup_scope(scopes, &inner.group) {
-        return Ok((scopes[idx].node, ""));
-    }
+) -> Result<(Vec<NodeId>, &'a str)> {
     let current = scopes.last().expect("nested loop has an enclosing scope").node;
-    match doc.find_group_within(current, &inner.group) {
-        Some(id) => Ok((id, inner.group.as_str())),
-        None => Err(XsqlError::spanned(
-            format!(
-                "cannot iterate `{}`: not a variable in scope nor a group inside <{}>",
-                inner.group,
-                doc.node(current).tag
-            ),
-            inner.span,
-        )),
+    match &inner.source {
+        LoopSource::Name(name) => {
+            if let Some(idx) = lookup_scope(scopes, name) {
+                return Ok((non_comment_children(doc, scopes[idx].node), ""));
+            }
+            match doc.find_group_within(current, name) {
+                Some(id) => Ok((non_comment_children(doc, id), name.as_str())),
+                None => Err(XsqlError::spanned(
+                    format!(
+                        "cannot iterate `{name}`: not a variable in scope nor a group inside <{}>",
+                        doc.node(current).tag
+                    ),
+                    inner.span,
+                )),
+            }
+        }
+        LoopSource::Tag(tag) => Ok((doc.find_tags_within(current, tag), tag.as_str())),
     }
 }
 

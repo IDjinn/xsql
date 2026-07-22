@@ -86,12 +86,31 @@ impl Source {
     }
 }
 
+/// What a verb operates on: a *group* (first element matched by tag, `name`
+/// or `id` attribute — a container whose children are iterated) or a *tag*
+/// (every element with that tag name, wherever it sits — for documents
+/// without a regular group structure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selector {
+    Group(String),
+    Tag(String),
+}
+
+impl Selector {
+    pub fn name(&self) -> &str {
+        match self {
+            Selector::Group(name) | Selector::Tag(name) => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Verb {
     /// `SELECT GROUP name [FOREACH ...]` — prints the group, or the matching
-    /// elements when a FOREACH filter is present.
+    /// elements when a FOREACH filter is present. `SELECT TAG name` prints
+    /// every element with that tag instead.
     Select {
-        group: String,
+        target: Selector,
         foreach: Option<Foreach>,
     },
     /// `REPLACE GROUP name RAW XML `...`` — replaces the group's children.
@@ -105,14 +124,37 @@ pub enum Verb {
     MergeInto { group: String, xml: String, xml_span: Span },
     /// `DELETE [IGNORE] GROUP name` — removes the whole group element.
     DeleteGroup { group: String, ignore: bool },
-    /// Bare mutation loop.
+    /// `DELETE [IGNORE] TAG name` — removes every element with that tag.
+    DeleteTag { tag: String, ignore: bool },
+    /// Bare mutation loop. Also the desugaring of the MySQL-style shorthands
+    /// (`UPDATE`, `MERGE ... SET`, `DELETE FROM`).
     Foreach(Foreach),
+}
+
+/// What a `FOREACH` iterates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopSource {
+    /// Group name at top level; in a nested loop, an enclosing loop variable
+    /// (iterates that element's children) or a group inside the current
+    /// element.
+    Name(String),
+    /// `IN TAG t` — every element with tag `t`: document-wide at top level,
+    /// within the current element's subtree when nested.
+    Tag(String),
+}
+
+impl LoopSource {
+    pub fn name(&self) -> &str {
+        match self {
+            LoopSource::Name(name) | LoopSource::Tag(name) => name,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Foreach {
     pub var: String,
-    pub group: String,
+    pub source: LoopSource,
     pub ops: Vec<Op>,
     pub span: Span,
 }

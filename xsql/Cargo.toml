@@ -8,3 +8,7 @@ license = "MIT"
 [dependencies]
 quick-xml = "0.37"
 rayon = "1.10"
+simdxml = { version = "0.2.1", optional = true }
+
+[features]
+simd = ["dep:simdxml"]

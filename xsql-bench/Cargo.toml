@@ -1,0 +1,14 @@
+[package]
+name = "xsql-bench"
+version = "0.1.0"
+edition = "2024"
+description = "Parser benchmark: quick-xml vs simdxml on real XML files"
+license = "MIT"
+publish = false
+
+[dependencies]
+xsql = { path = "../xsql", features = ["simd"] }
+
+[[bin]]
+name = "xsql-bench"
+path = "src/main.rs"

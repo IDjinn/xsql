@@ -106,6 +106,36 @@ impl Document {
         None
     }
 
+    /// Every element whose tag equals `tag`, document order (depth-first).
+    /// Unlike a group lookup this matches only the tag — `name`/`id`
+    /// attributes do not participate — and returns *all* matches.
+    pub fn find_tags(&self, tag: &str) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = self.roots.iter().rev().copied().collect();
+        while let Some(id) = stack.pop() {
+            let el = self.node(id);
+            if el.tag == tag {
+                out.push(id);
+            }
+            stack.extend(el.children.iter().rev());
+        }
+        out
+    }
+
+    /// Like [`Self::find_tags`], but searches only the descendants of `root`.
+    pub fn find_tags_within(&self, root: NodeId, tag: &str) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = self.node(root).children.iter().rev().copied().collect();
+        while let Some(id) = stack.pop() {
+            let el = self.node(id);
+            if el.tag == tag {
+                out.push(id);
+            }
+            stack.extend(el.children.iter().rev());
+        }
+        out
+    }
+
     /// Detaches `id` from its parent (or from the root list).
     pub fn detach(&mut self, id: NodeId) {
         match self.nodes[id].parent {

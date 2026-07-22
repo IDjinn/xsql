@@ -80,6 +80,20 @@ FOREACH office IN office
     BREAK;
 ;
 
+; the same edit, MySQL style: UPDATE is sugar for the loop above
+; (LIMIT 1 = stop after the first match, like BREAK)
+UPDATE office SET name = "New Office Name" WHERE id = 216000 LIMIT 1;
+
+; without WHERE/LIMIT it updates every element of the group;
+; assignments take full expressions and multiple targets
+UPDATE goods SET cost = cost * 2, level = level + 1 WHERE cost > 500;
+
+; MERGE shorthand: write only where the attribute is missing
+MERGE arms SET tier = 1;
+
+; DELETE FROM removes matching elements (DELETE GROUP removes the container)
+DELETE FROM goods WHERE cost > 500;
+
 ; upsert (idempotent): match children by id (then name, then tag);
 ; matched -> cited attributes updated, the rest preserved; no match -> inserted
 MERGE INTO GROUP goods
@@ -111,6 +125,20 @@ FOREACH office IN offices
         SET office.total = office.total + member.cost
 ;
 
+; TAG selects by tag name instead of by group: it matches EVERY element
+; with that tag, wherever it sits — for documents without a regular
+; group/container structure. GROUP matches one container (by tag, `name`
+; or `id`) and iterates its children; TAG iterates the matches themselves.
+SELECT TAG ItemSpec;                            all ItemSpec elements, any depth
+FOREACH i IN TAG ItemSpec SET i.reviewed = 1;   document-wide edit
+UPDATE TAG ItemSpec SET cost = 0 WHERE cost < 0;
+DELETE TAG Obsolete;                            removes every <Obsolete> element
+; nested: IN TAG searches only the current element's subtree
+FOREACH office IN offices
+    FOREACH m IN TAG Member
+        SET m.office = office.id
+;
+
 ; more verbs
 INSERT INTO GROUP goods RAW XML `<ItemSpec id="999"/>`;
 DELETE GROUP legacy_stuff;
@@ -131,7 +159,13 @@ ANALYZE;                   print per-stage timings to stderr
 | `INSERT INTO GROUP g RAW XML \`...\`` | appends the fragment to the group |
 | `MERGE INTO GROUP g RAW XML \`...\`` | upsert (idempotent): matches children by `id`, then `name`, then tag; matched → cited attributes updated (rest preserved; fragment children, when present, replace the existing ones), unmatched → inserted |
 | `DELETE [IGNORE] GROUP g` | removes the whole group element |
+| `DELETE [IGNORE] TAG t` | removes every element with tag `t` (`IGNORE`: no error when none match) |
+| `SELECT TAG t [FOREACH ...\|OUTPUT ...]` | prints every element with tag `t`, wherever it sits |
+| `UPDATE (TAG t \| [GROUP] g) SET a = e, ... [WHERE expr] [LIMIT 1]` | MySQL-style sugar for a FOREACH: guard, then the SETs; `LIMIT 1` = BREAK after the first match |
+| `MERGE (TAG t \| [GROUP] g) SET a = e, ... [WHERE expr] [LIMIT 1]` | same, but attributes are written only where missing (idempotent) |
+| `DELETE FROM (TAG t \| [GROUP] g) [WHERE expr] [LIMIT 1]` | removes the matching elements (the container survives) |
 | `FOREACH v IN g <ops>` | iterates the group's direct children |
+| `FOREACH v IN TAG t <ops>` | iterates every element with tag `t` — document-wide at top level, within the current element's subtree when nested (zero nested matches iterate nothing) |
 | `FOREACH v2 IN v <ops>` (nested) | iterates the current element's children (`v` = an enclosing loop variable) or a group found inside the current element; ops after a nested loop belong to it, and a `BREAK` inside it only ends the inner loop |
 | `WHERE <expr>` | guard: skips remaining ops for non-matching elements (a missing attribute participates as null) |
 | `WHERE REQUIRED attr <cond>` | like WHERE, but the attribute is mandatory: an element without it is a hard error (plain WHERE skips it silently) |
@@ -154,7 +188,9 @@ Settings (values `ON`/`OFF`, also `TRUE`/`FALSE`/`1`/`0`; names case-insensitive
 | `ANALYZE` | `OFF` | `ON`: after the run, prints a per-stage report to stderr — lex, parse, stdin/file read, XML parse per document, per-block execution, serialization, output assembly, stdout write, total DOM memory, total time |
 
 A *group* is the first element whose tag — or `name`/`id` attribute — equals
-the given name. Group names may be identifiers (`arms`), numbers
+the given name. A *tag* selector (`TAG t`) instead matches **all** elements
+whose tag equals `t` — attributes don't participate — at any depth; use it
+when the document has no reliable group structure. Group names may be identifiers (`arms`), numbers
 (`SELECT GROUP 110000` — matches `<Group id="110000">`), or quoted strings
 (`SELECT GROUP "Group"` — for names that collide with keywords). Inside a loop, the loop variable, the group name and a bare
 attribute name all refer to the current element (`good.id`, `goods.id` and
@@ -174,7 +210,10 @@ Missing attributes compare as false (SQL-NULL-ish).
 - Rayon parallelism: documents load/parse in parallel, blocks for different
   documents execute in parallel, and large `FOREACH` loops (≥1024 children,
   no `BREAK`) evaluate expressions in parallel before applying mutations
-  sequentially — exact sequential semantics, parallel speed.
+  sequentially — exact sequential semantics, parallel speed. TAG loops
+  parallelize only when no match is nested inside another.
+- Output strings are pre-sized from the DOM (serializer and final output
+  assembly), avoiding repeated reallocation on large documents.
 
 ## Workspace
 

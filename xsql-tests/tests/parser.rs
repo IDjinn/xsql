@@ -1,4 +1,4 @@
-use xsql::ast::{Op, Setting, Settings, Source, Verb};
+use xsql::ast::{LoopSource, Op, Selector, Setting, Settings, Source, Verb};
 use xsql::parser::parse;
 
 /// The four scripts from the original scratch file must parse verbatim.
@@ -42,10 +42,10 @@ FOREACH office IN office
 
     assert_eq!(script.blocks.len(), 4);
 
-    let Verb::Select { group, foreach } = &script.blocks[0].verb else {
+    let Verb::Select { target, foreach } = &script.blocks[0].verb else {
         panic!("block 0 should be SELECT");
     };
-    assert_eq!(group, "arms");
+    assert_eq!(target, &Selector::Group("arms".into()));
     let ops = &foreach.as_ref().unwrap().ops;
     assert_eq!(ops.len(), 2);
     assert!(matches!(&ops[0], Op::DeleteAttr { attr, ignore: true, .. } if attr == "unlock_civi_science"));
@@ -118,7 +118,7 @@ fn nested_foreach_and_merge_attr_parse() {
     assert!(matches!(&outer.ops[0], Op::Where(_)));
     let Op::Foreach(inner) = &outer.ops[1] else { panic!("expected nested FOREACH") };
     assert_eq!(inner.var, "s");
-    assert_eq!(inner.group, "office");
+    assert_eq!(inner.source, LoopSource::Name("office".into()));
     assert!(matches!(&inner.ops[0], Op::Merge { var, attr, .. } if var == "s" && attr == "tier"));
 }
 
@@ -167,8 +167,14 @@ fn numeric_and_quoted_group_names() {
         "USE db.xml\nSELECT GROUP 110000 FOREACH item IN 110000 WHERE item.id < 5;\nSELECT GROUP \"Group\";",
     )
     .unwrap();
-    assert!(matches!(&script.blocks[0].verb, Verb::Select { group, .. } if group == "110000"));
-    assert!(matches!(&script.blocks[1].verb, Verb::Select { group, .. } if group == "Group"));
+    assert!(matches!(
+        &script.blocks[0].verb,
+        Verb::Select { target: Selector::Group(g), .. } if g == "110000"
+    ));
+    assert!(matches!(
+        &script.blocks[1].verb,
+        Verb::Select { target: Selector::Group(g), .. } if g == "Group"
+    ));
 }
 
 #[test]
@@ -185,7 +191,7 @@ fn expression_precedence() {
 #[test]
 fn parse_error_reports_span() {
     let err = parse("USE db.xml\nSELECT arms;").unwrap_err();
-    assert!(err.message.contains("expected `GROUP`"), "{}", err.message);
+    assert!(err.message.contains("expected GROUP or TAG"), "{}", err.message);
     assert_eq!(err.span.unwrap().line, 2);
 }
 
@@ -233,4 +239,78 @@ fn setting_value_must_be_on_or_off() {
 fn set_requires_dotted_target() {
     let err = parse("USE db.xml FOREACH a IN g SET name = \"x\";").unwrap_err();
     assert!(err.message.contains("variable.attribute"), "{}", err.message);
+}
+
+#[test]
+fn update_desugars_to_foreach() {
+    // WHERE guard first, then the writes, then BREAK for LIMIT 1.
+    let script = parse(
+        "USE db.xml\nUPDATE office SET name = \"New\", office.cost = cost + 1 WHERE office.id = 216000 LIMIT 1;",
+    )
+    .unwrap();
+    let Verb::Foreach(f) = &script.blocks[0].verb else { panic!("expected desugared FOREACH") };
+    assert_eq!(f.var, "office");
+    assert_eq!(f.source, LoopSource::Name("office".into()));
+    assert!(matches!(&f.ops[0], Op::Where(_)));
+    assert!(matches!(&f.ops[1], Op::Set { var, attr, .. } if var.is_empty() && attr == "name"));
+    assert!(matches!(&f.ops[2], Op::Set { var, attr, .. } if var == "office" && attr == "cost"));
+    assert!(matches!(&f.ops[3], Op::Break));
+    assert_eq!(f.ops.len(), 4);
+}
+
+#[test]
+fn update_without_where_or_limit() {
+    let script = parse("USE db.xml\nUPDATE GROUP goods SET level = 1;").unwrap();
+    let Verb::Foreach(f) = &script.blocks[0].verb else { panic!() };
+    assert!(matches!(&f.ops[0], Op::Set { attr, .. } if attr == "level"));
+    assert_eq!(f.ops.len(), 1);
+}
+
+#[test]
+fn merge_shorthand_desugars_to_merge_ops() {
+    let script = parse("USE db.xml\nMERGE arms SET tier = 1 WHERE cost > 100;").unwrap();
+    let Verb::Foreach(f) = &script.blocks[0].verb else { panic!() };
+    assert!(matches!(&f.ops[0], Op::Where(_)));
+    assert!(matches!(&f.ops[1], Op::Merge { attr, .. } if attr == "tier"));
+}
+
+#[test]
+fn delete_from_desugars_to_delete_elem() {
+    let script = parse("USE db.xml\nDELETE FROM goods WHERE cost > 500 LIMIT 1;").unwrap();
+    let Verb::Foreach(f) = &script.blocks[0].verb else { panic!() };
+    assert!(matches!(&f.ops[0], Op::Where(_)));
+    assert!(matches!(&f.ops[1], Op::DeleteElem { .. }));
+    assert!(matches!(&f.ops[2], Op::Break));
+}
+
+#[test]
+fn tag_selector_parses_everywhere() {
+    let script = parse(
+        "USE db.xml\nSELECT TAG ItemSpec;\nFOREACH i IN TAG ItemSpec SET i.seen = 1;\nDELETE IGNORE TAG Obsolete;\nUPDATE TAG ItemSpec SET cost = 0;",
+    )
+    .unwrap();
+    assert!(matches!(
+        &script.blocks[0].verb,
+        Verb::Select { target: Selector::Tag(t), foreach: None } if t == "ItemSpec"
+    ));
+    let Verb::Foreach(f) = &script.blocks[1].verb else { panic!() };
+    assert_eq!(f.source, LoopSource::Tag("ItemSpec".into()));
+    assert!(matches!(
+        &script.blocks[2].verb,
+        Verb::DeleteTag { tag, ignore: true } if tag == "Obsolete"
+    ));
+    let Verb::Foreach(f) = &script.blocks[3].verb else { panic!() };
+    assert_eq!(f.source, LoopSource::Tag("ItemSpec".into()));
+}
+
+#[test]
+fn limit_other_than_one_is_an_error() {
+    let err = parse("USE db.xml\nUPDATE g SET a = 1 LIMIT 2;").unwrap_err();
+    assert!(err.message.contains("only LIMIT 1"), "{}", err.message);
+}
+
+#[test]
+fn delete_from_rejects_ignore() {
+    let err = parse("USE db.xml\nDELETE IGNORE FROM goods;").unwrap_err();
+    assert!(err.message.contains("IGNORE is not supported"), "{}", err.message);
 }

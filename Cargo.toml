@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["xsql", "xsql-tests"]
+members = ["xsql", "xsql-tests", "xsql-bench"]
 
 [profile.release]
 lto = true

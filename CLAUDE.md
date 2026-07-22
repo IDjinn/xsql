@@ -36,5 +36,6 @@ Classic interpreter pipeline, one module per stage in `xsql/src/`:
 ## Invariants to respect
 
 - Parallelism must never change observable behavior — the evaluate-then-apply split and per-document block grouping exist to keep results identical to sequential execution.
-- A *group* lookup matches the first element whose tag, `name`, or `id` attribute equals the given name.
+- A *group* lookup matches the first element whose tag, `name`, or `id` attribute equals the given name. A *tag* lookup (`TAG t`) matches **every** element whose tag equals `t` (attributes don't participate); tag-based loops only take the parallel FOREACH path after a disjointness check, since matches can nest.
+- The MySQL-style shorthands (`UPDATE`, `MERGE ... SET`, `DELETE FROM`) are pure parser sugar: they desugar to `Verb::Foreach` (`WHERE` guard first, then the writes, `LIMIT 1` → `BREAK`) — the interpreter never sees them.
 - Inside a `FOREACH`, the loop variable, group name, and bare attribute name all resolve to the current element.
