@@ -737,7 +737,13 @@ impl Parser {
             Tok::Ident(name) => {
                 self.bump();
                 if self.eat(&Tok::LParen) {
-                    let arg = self.expr()?;
+                    let arg = if self.peek() == &Tok::Star {
+                        let star_span = self.span();
+                        self.bump();
+                        Expr::Star(star_span)
+                    } else {
+                        self.expr()?
+                    };
                     self.expect(Tok::RParen, "to close the function call")?;
                     return Ok(Expr::Call { func: name, arg: Box::new(arg), span });
                 }

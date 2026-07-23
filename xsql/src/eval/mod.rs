@@ -690,14 +690,14 @@ struct ChildPlan {
     /// Each entry has one slot per aggregate item, `None` when that item's
     /// argument was missing/non-numeric on that reach (skipped, like a null
     /// attribute elsewhere in the language).
-    agg_contribs: Vec<Vec<Option<f64>>>,
+    agg_contribs: Vec<Vec<Option<Value>>>,
 }
 
 struct ForeachOutcome {
     selected: Vec<NodeId>,
     emits: Vec<Emit>,
     mutations: usize,
-    agg_contribs: Vec<Vec<Option<f64>>>,
+    agg_contribs: Vec<Vec<Option<Value>>>,
 }
 
 /// Whether the loop (or any nested loop) contains an OUTPUT op — when it
@@ -721,13 +721,23 @@ fn collect_outputs<'a>(foreach: &'a Foreach, out: &mut Vec<&'a Op>) {
     }
 }
 
+/// Known aggregate function names, valid only as a direct `OUTPUT` item.
+const AGGREGATE_FUNCS: &[&str] =
+    &["COUNT", "MIN", "MAX", "SUM", "AVG", "FIRST", "LAST", "ANY", "ALL"];
+
+/// One aggregate `OUTPUT` item: just the function name (uppercase) — `*` vs
+/// a real expression is a plan-time distinction, not needed once validated.
+struct AggItem {
+    func: String,
+}
+
 /// If this foreach's only `OUTPUT` is a pure-aggregate one (every item a
-/// `COUNT`/`MIN`/`MAX`/`SUM`/`AVG` call), returns its `(function, name)`
-/// list. A `None` OUTPUT (absent, or plain) means no aggregate handling is
-/// needed. Mixing an aggregate OUTPUT with any other OUTPUT — aggregate or
-/// plain — in the same foreach is rejected: there's no single row for a
-/// per-element OUTPUT and a whole-loop aggregate to share.
-fn aggregate_output(foreach: &Foreach) -> Result<Option<Vec<(String, String)>>> {
+/// `COUNT`/`MIN`/`MAX`/`SUM`/`AVG`/`FIRST`/`LAST`/`ANY`/`ALL` call), returns
+/// its item list. A `None` OUTPUT (absent, or plain) means no aggregate
+/// handling is needed. Mixing an aggregate OUTPUT with any other OUTPUT —
+/// aggregate or plain — in the same foreach is rejected: there's no single
+/// row for a per-element OUTPUT and a whole-loop aggregate to share.
+fn aggregate_output(foreach: &Foreach) -> Result<Option<Vec<AggItem>>> {
     let mut outputs = Vec::new();
     collect_outputs(foreach, &mut outputs);
     let is_agg = |items: &[(Expr, String)]| items.iter().any(|(e, _)| matches!(e, Expr::Call { .. }));
@@ -741,16 +751,25 @@ fn aggregate_output(foreach: &Foreach) -> Result<Option<Vec<(String, String)>>> 
                 ));
             }
             let mut names = Vec::with_capacity(items.len());
-            for (expr, name) in items {
-                let Expr::Call { func, span: call_span, .. } = expr else { unreachable!() };
+            for (expr, _name) in items {
+                let Expr::Call { func, arg, span: call_span } = expr else { unreachable!() };
                 let func = func.to_ascii_uppercase();
-                if !matches!(func.as_str(), "COUNT" | "MIN" | "MAX" | "SUM" | "AVG") {
+                if !AGGREGATE_FUNCS.contains(&func.as_str()) {
                     return Err(XsqlError::spanned(
-                        format!("unknown aggregate function `{func}` (known: COUNT, MIN, MAX, SUM, AVG)"),
+                        format!(
+                            "unknown aggregate function `{func}` (known: {})",
+                            AGGREGATE_FUNCS.join(", ")
+                        ),
                         *call_span,
                     ));
                 }
-                names.push((func, name.clone()));
+                if matches!(**arg, Expr::Star(_)) && func != "COUNT" {
+                    return Err(XsqlError::spanned(
+                        format!("`{func}(*)` is invalid: only COUNT(*) supports `*`"),
+                        *call_span,
+                    ));
+                }
+                names.push(AggItem { func });
             }
             Ok(Some(names))
         }
@@ -776,33 +795,45 @@ fn aggregate_output(foreach: &Foreach) -> Result<Option<Vec<(String, String)>>> 
 
 /// Combines every reach's per-item contribution into the loop's final
 /// aggregate values, formatted as a comma-joined line (no XML — the whole
-/// point of an aggregate OUTPUT is a bare number). Aliases are not printed:
-/// with a single row there is nothing to disambiguate. A function with zero
-/// contributing rows (loop matched nothing, or every value was non-numeric)
-/// reports `0`.
-fn render_aggregate(items: &[(String, String)], contribs: &[Vec<Option<f64>>]) -> String {
+/// point of an aggregate OUTPUT is a bare value, not a per-element row).
+/// Aliases are not printed: with a single row there is nothing to
+/// disambiguate. `COUNT`/`MIN`/`MAX`/`SUM`/`AVG` report `0` when nothing
+/// contributed; `FIRST`/`LAST` report an empty value; `ANY` reports `false`;
+/// `ALL` reports `true` (vacuously, same as SQL).
+fn render_aggregate(items: &[AggItem], contribs: &[Vec<Option<Value>>]) -> String {
     let mut parts = Vec::with_capacity(items.len());
-    for (i, (func, _name)) in items.iter().enumerate() {
-        let values: Vec<f64> = contribs
+    for (i, item) in items.iter().enumerate() {
+        let col: Vec<&Value> = contribs
             .iter()
-            .filter_map(|reach| reach.get(i).copied().flatten())
+            .filter_map(|reach| reach.get(i).and_then(|v| v.as_ref()))
             .collect();
-        let result = match func.as_str() {
-            "COUNT" => values.len() as f64,
-            "SUM" => values.iter().sum(),
-            "AVG" => {
-                if values.is_empty() {
-                    0.0
-                } else {
-                    values.iter().sum::<f64>() / values.len() as f64
-                }
+        let text = match item.func.as_str() {
+            "COUNT" => Value::Num(col.len() as f64).to_display(),
+            "SUM" | "AVG" | "MIN" | "MAX" => {
+                let nums: Vec<f64> = col.iter().filter_map(|v| v.as_num()).collect();
+                let result = match item.func.as_str() {
+                    "SUM" => nums.iter().sum(),
+                    "AVG" => {
+                        if nums.is_empty() {
+                            0.0
+                        } else {
+                            nums.iter().sum::<f64>() / nums.len() as f64
+                        }
+                    }
+                    "MIN" => nums.iter().copied().fold(f64::INFINITY, f64::min),
+                    "MAX" => nums.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                    _ => unreachable!(),
+                };
+                let result = if result.is_finite() { result } else { 0.0 };
+                Value::Num(result).to_display()
             }
-            "MIN" => values.iter().copied().fold(f64::INFINITY, f64::min),
-            "MAX" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            "FIRST" => col.first().map(|v| v.to_display()).unwrap_or_default(),
+            "LAST" => col.last().map(|v| v.to_display()).unwrap_or_default(),
+            "ANY" => Value::Bool(col.iter().any(|v| v.truthy())).to_display(),
+            "ALL" => Value::Bool(col.iter().all(|v| v.truthy())).to_display(),
             _ => unreachable!("validated by aggregate_output"),
         };
-        let result = if !result.is_finite() { 0.0 } else { result };
-        parts.push(Value::Num(result).to_display());
+        parts.push(text);
     }
     parts.join(",") + "\n"
 }
@@ -971,7 +1002,7 @@ fn plan_element<'a>(
     scopes: &mut Vec<Scope<'a>>,
     actions: &mut Vec<(NodeId, Action)>,
     emits: &mut Vec<Emit>,
-    agg_contribs: &mut Vec<Vec<Option<f64>>>,
+    agg_contribs: &mut Vec<Vec<Option<Value>>>,
 ) -> Result<(bool, bool)> {
     scopes.push(Scope { var: &foreach.var, alias, node, changes: Vec::new() });
     let result = plan_ops(doc, foreach, scopes, actions, emits, agg_contribs);
@@ -986,7 +1017,7 @@ fn plan_ops<'a>(
     scopes: &mut Vec<Scope<'a>>,
     actions: &mut Vec<(NodeId, Action)>,
     emits: &mut Vec<Emit>,
-    agg_contribs: &mut Vec<Vec<Option<f64>>>,
+    agg_contribs: &mut Vec<Vec<Option<Value>>>,
 ) -> Result<(bool, bool)> {
     let mut selected = true;
     for (op_idx, op) in foreach.ops.iter().enumerate() {
@@ -1094,15 +1125,25 @@ fn plan_ops<'a>(
                     let mut reach = Vec::with_capacity(items.len());
                     for (expr, _name) in items {
                         let Expr::Call { func, arg, span } = expr else { unreachable!() };
+                        let func = func.to_ascii_uppercase();
+                        if matches!(**arg, Expr::Star(_)) {
+                            // `COUNT(*)`: counts the row unconditionally, no
+                            // expression to evaluate.
+                            reach.push(Some(Value::Bool(true)));
+                            continue;
+                        }
                         let value = eval_expr(doc, arg, scopes)?;
-                        reach.push(match func.to_ascii_uppercase().as_str() {
-                            "COUNT" => (!matches!(value, Value::Null)).then_some(1.0),
-                            "MIN" | "MAX" | "SUM" | "AVG" => value.as_num(),
+                        reach.push(match func.as_str() {
+                            "COUNT" | "FIRST" | "LAST" => {
+                                (!matches!(value, Value::Null)).then_some(value)
+                            }
+                            "MIN" | "MAX" | "SUM" | "AVG" => value.as_num().map(Value::Num),
+                            "ANY" | "ALL" => Some(Value::Bool(value.truthy())),
                             other => {
                                 return Err(XsqlError::spanned(
                                     format!(
-                                        "unknown aggregate function `{other}` \
-                                         (known: COUNT, MIN, MAX, SUM, AVG)"
+                                        "unknown aggregate function `{other}` (known: {})",
+                                        AGGREGATE_FUNCS.join(", ")
                                     ),
                                     *span,
                                 ));
@@ -1248,6 +1289,10 @@ fn eval_expr(doc: &Document, expr: &Expr, scopes: &[Scope]) -> Result<Value> {
         }
         Expr::Call { func, span, .. } => Err(XsqlError::spanned(
             format!("`{func}(...)` is an aggregate function: it can only be used as a direct OUTPUT item"),
+            *span,
+        )),
+        Expr::Star(span) => Err(XsqlError::spanned(
+            "`*` is only valid as `COUNT(*)`'s argument",
             *span,
         )),
     }

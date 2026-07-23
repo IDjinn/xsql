@@ -712,3 +712,61 @@ fn output_unknown_aggregate_function_errors() {
     let err = run(&script, Some(aggregate_fixture().to_string())).unwrap_err();
     assert!(err.message.contains("unknown aggregate function `NOPE`"), "{}", err.message);
 }
+
+#[test]
+fn output_first_last_return_reach_order_values() {
+    let script = parse(
+        "USE INPUT\nFOREACH v IN TAG ItemSpec WHERE v.type = 0 OUTPUT FIRST(v.id), LAST(v.id);",
+    )
+    .unwrap();
+    let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
+    assert_eq!(out, "1,3\n");
+}
+
+#[test]
+fn output_first_last_with_zero_matches_is_empty() {
+    let script = parse(
+        "USE INPUT\nFOREACH v IN TAG ItemSpec WHERE v.type = 99 OUTPUT FIRST(v.id), LAST(v.id);",
+    )
+    .unwrap();
+    let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
+    assert_eq!(out, ",\n");
+}
+
+#[test]
+fn output_count_star_counts_every_row_regardless_of_nulls() {
+    let script = parse(
+        "USE INPUT\nFOREACH v IN TAG ItemSpec WHERE v.type = 0 OUTPUT COUNT(*), COUNT(v.missing);",
+    )
+    .unwrap();
+    let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
+    assert_eq!(out, "2,0\n");
+}
+
+#[test]
+fn output_count_star_only_valid_on_count() {
+    let script = parse("USE INPUT\nFOREACH v IN TAG ItemSpec OUTPUT SUM(*);").unwrap();
+    let err = run(&script, Some(aggregate_fixture().to_string())).unwrap_err();
+    assert!(err.message.contains("only COUNT(*) supports"), "{}", err.message);
+}
+
+#[test]
+fn output_any_all_evaluate_truthiness_across_reached_rows() {
+    let script = parse(
+        "USE INPUT\nFOREACH v IN TAG ItemSpec WHERE v.type = 0 \
+         OUTPUT ANY(v.cost > 25), ALL(v.cost > 5);",
+    )
+    .unwrap();
+    let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
+    assert_eq!(out, "true,true\n");
+}
+
+#[test]
+fn output_all_with_zero_matches_is_vacuously_true() {
+    let script = parse(
+        "USE INPUT\nFOREACH v IN TAG ItemSpec WHERE v.type = 99 OUTPUT ANY(v.cost > 0), ALL(v.cost > 0);",
+    )
+    .unwrap();
+    let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
+    assert_eq!(out, "false,true\n");
+}

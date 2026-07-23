@@ -330,6 +330,16 @@ fn aggregate_function_call_parses_as_expr_call() {
 }
 
 #[test]
+fn count_star_parses_as_expr_star_argument() {
+    let script = parse("USE db.xml\nFOREACH v IN g OUTPUT COUNT(*);").unwrap();
+    let Verb::Foreach(f) = &script.blocks[0].verb else { panic!() };
+    let Op::Output { items, .. } = &f.ops[0] else { panic!() };
+    let Expr::Call { func, arg, .. } = &items[0].0 else { panic!() };
+    assert_eq!(func, "COUNT");
+    assert!(matches!(**arg, Expr::Star(_)));
+}
+
+#[test]
 fn limit_other_than_one_is_an_error() {
     let err = parse("USE db.xml\nUPDATE g SET a = 1 LIMIT 2;").unwrap_err();
     assert!(err.message.contains("only LIMIT 1"), "{}", err.message);

@@ -145,14 +145,19 @@ FOREACH office IN offices
 FOREACH v IN ROOT WHERE v.type = 0 OUTPUT v.id;
 UPDATE ROOT SET reviewed = 1 WHERE cost > 500;
 
-; aggregate OUTPUT: COUNT/MIN/MAX/SUM/AVG summarize the whole loop into one
-; row of bare numbers instead of one row per element — no XML wrapper.
-; A pure-aggregate OUTPUT must be the loop's only OUTPUT (no mixing with
-; plain attributes/expressions); zero contributing rows reports 0.
+; aggregate OUTPUT: COUNT/MIN/MAX/SUM/AVG/FIRST/LAST/ANY/ALL summarize the
+; whole loop into one row of bare values instead of one row per element —
+; no XML wrapper. A pure-aggregate OUTPUT must be the loop's only OUTPUT (no
+; mixing with plain attributes/expressions); zero contributing rows reports
+; 0 (COUNT/MIN/MAX/SUM/AVG), an empty value (FIRST/LAST), false (ANY) or
+; true (ALL, vacuously — same as SQL).
 FOREACH v IN ItemSpec WHERE v.type = 0 OUTPUT COUNT(v.id);              ; -> 2
 FOREACH v IN ItemSpec WHERE v.type = 0
     OUTPUT MIN(v.cost), MAX(v.cost), SUM(v.cost), AVG(v.cost)
 ;                                                                        ; -> 10,30,40,20
+FOREACH v IN ItemSpec WHERE v.type = 0 OUTPUT FIRST(v.name), LAST(v.name);
+FOREACH v IN ItemSpec OUTPUT COUNT(*);                                  ; every row, nulls included
+FOREACH v IN ItemSpec WHERE v.type = 0 OUTPUT ANY(v.cost > 25), ALL(v.cost > 5);
 
 ; more verbs
 INSERT INTO GROUP goods RAW XML `<ItemSpec id="999"/>`;
@@ -190,7 +195,7 @@ ANALYZE;                   print per-stage timings to stderr
 | `MERGE v.attr = <expr>` | writes the attribute only when missing; an existing value wins, even a different one (idempotent) |
 | `OUTPUT <expr> [AS name], ...` | emission point: prints a flat element with only the cited attributes/expressions, evaluated when execution reaches it (missing attributes are omitted; non-attribute expressions need `AS`); works in SELECT loops, plain FOREACH loops and nested loops (mixing scopes into one row) |
 | `OUTPUT *` | prints the whole current element — the implicit default of a SELECT loop without OUTPUT |
-| `OUTPUT COUNT(expr) \| MIN(expr) \| MAX(expr) \| SUM(expr) \| AVG(expr), ...` | aggregate: summarizes every element the loop reaches into one comma-joined line of plain numbers (no XML, no per-element rows). Must be the loop's only OUTPUT; `COUNT` counts non-null values, the rest ignore non-numeric/missing values; zero contributing rows reports `0` |
+| `OUTPUT COUNT(expr\|*) \| MIN \| MAX \| SUM \| AVG \| FIRST \| LAST \| ANY \| ALL(expr), ...` | aggregate: summarizes every element the loop reaches into one comma-joined line of plain values (no XML, no per-element rows). Must be the loop's only OUTPUT; `COUNT(expr)` counts non-null values, `COUNT(*)` counts every row unconditionally, `MIN`/`MAX`/`SUM`/`AVG` ignore non-numeric/missing values, `FIRST`/`LAST` return the first/last non-null value in reach order, `ANY`/`ALL` are boolean over every reached row's truthiness; zero contributing rows reports `0` (COUNT/MIN/MAX/SUM/AVG), empty (FIRST/LAST), `false` (ANY) or `true` (ALL, vacuously) |
 | `DELETE [IGNORE] v.attr` | removes an attribute (`IGNORE`: no error if absent) |
 | `DELETE v` | removes the current element |
 | `BREAK` | stops the loop |
@@ -225,11 +230,14 @@ attribute references. Values are dynamically typed — numeric semantics apply
 whenever both operands parse as numbers; `+` on non-numbers concatenates.
 Missing attributes compare as false (SQL-NULL-ish).
 
-Aggregate functions (`COUNT`, `MIN`, `MAX`, `SUM`, `AVG`) are only valid as a
-direct `OUTPUT` item — `OUTPUT COUNT(v.id)`, not `WHERE COUNT(v.id) > 0`.
-They replace the loop's usual one-row-per-element `OUTPUT` with a single
-line of comma-joined plain numbers, computed over every element the loop
-reaches (after `WHERE`).
+Aggregate functions (`COUNT`, `MIN`, `MAX`, `SUM`, `AVG`, `FIRST`, `LAST`,
+`ANY`, `ALL`) are only valid as a direct `OUTPUT` item — `OUTPUT
+COUNT(v.id)`, not `WHERE COUNT(v.id) > 0`. They replace the loop's usual
+one-row-per-element `OUTPUT` with a single line of comma-joined plain
+values, computed over every element the loop reaches (after `WHERE`).
+`COUNT(*)` is the one exception that takes a literal `*` instead of an
+expression: it counts every reached row, including ones where a normal
+`COUNT(expr)` would skip a null.
 
 ## Performance
 
@@ -253,8 +261,8 @@ reaches (after `WHERE`).
 
 - Preserve original formatting on output (attribute order is kept; comments
   are kept with `SET IGNORE_COMMENTS = OFF`; whitespace layout is not).
-- More aggregate functions: `FIRST`/`LAST` (first/last matching element's
-  value), `CONCAT`/`GROUP_CONCAT` (join values with a separator), a distinct
-  variant of `COUNT`. `GROUP BY`-style multi-row aggregation (one aggregate
-  row per distinct value of some attribute, instead of one row for the whole
-  loop) is a bigger, separate feature.
+- More aggregate functions: `CONCAT`/`GROUP_CONCAT` (join values with a
+  separator), a distinct-values variant of `COUNT`. `GROUP BY`-style
+  multi-row aggregation (one aggregate row per distinct value of some
+  attribute, instead of one row for the whole loop) is a bigger, separate
+  feature.

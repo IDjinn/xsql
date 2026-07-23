@@ -243,13 +243,17 @@ pub enum Expr {
     Not(Box<Expr>, Span),
     Neg(Box<Expr>, Span),
     /// `FUNC(expr)` — an aggregate function call (`COUNT`, `MIN`, `MAX`,
-    /// `SUM`, `AVG`). Only valid as an `OUTPUT` item; evaluated across every
-    /// element the loop reaches, not per element.
+    /// `SUM`, `AVG`, `FIRST`, `LAST`, `ANY`, `ALL`). Only valid as an
+    /// `OUTPUT` item; evaluated across every element the loop reaches, not
+    /// per element.
     Call {
         func: String,
         arg: Box<Expr>,
         span: Span,
     },
+    /// Bare `*`, only meaningful as `COUNT(*)`'s argument (counts every
+    /// reached row, unlike `COUNT(expr)` which skips nulls).
+    Star(Span),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
