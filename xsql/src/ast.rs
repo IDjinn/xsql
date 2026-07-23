@@ -110,11 +110,14 @@ impl Selector {
 
 #[derive(Debug, Clone)]
 pub enum Verb {
-    /// `SELECT GROUP name [FOREACH ...]` — prints the group, or the matching
-    /// elements when a FOREACH filter is present. `SELECT TAG name` prints
-    /// every element with that tag instead.
+    /// `SELECT GROUP name [AS alias] [FOREACH ...]` — prints the group, or
+    /// the matching elements when a FOREACH filter is present. `SELECT TAG
+    /// name` prints every element with that tag instead. `AS alias` renames
+    /// the tag of each printed element on the way out — display-only, the
+    /// document itself is untouched (see `RENAME` for a permanent rename).
     Select {
         target: Selector,
+        alias: Option<String>,
         foreach: Option<Foreach>,
     },
     /// `REPLACE GROUP name RAW XML `...`` — replaces the group's children.
@@ -130,6 +133,12 @@ pub enum Verb {
     DeleteGroup { group: String, ignore: bool },
     /// `DELETE [IGNORE] TAG name` — removes every element with that tag.
     DeleteTag { tag: String, ignore: bool },
+    /// `RENAME [IGNORE] GROUP name AS new_tag` — permanently renames the
+    /// group element's tag.
+    RenameGroup { group: String, new_tag: String, ignore: bool },
+    /// `RENAME [IGNORE] TAG name AS new_tag` — permanently renames the tag
+    /// of every element with that tag.
+    RenameTag { tag: String, new_tag: String, ignore: bool },
     /// Bare mutation loop. Also the desugaring of the MySQL-style shorthands
     /// (`UPDATE`, `MERGE ... SET`, `DELETE FROM`).
     Foreach(Foreach),

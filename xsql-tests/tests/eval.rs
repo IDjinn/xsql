@@ -770,3 +770,69 @@ fn output_all_with_zero_matches_is_vacuously_true() {
     let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
     assert_eq!(out, "false,true\n");
 }
+
+// ---------------------------------------------------------------------------
+// SELECT ... AS alias (display-only rename) / RENAME (permanent rename)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn select_group_as_alias_renames_only_the_outer_tag() {
+    let out = run_on_fixture("SELECT GROUP arms AS weapons;");
+    assert!(out.starts_with("<weapons>"), "{out}");
+    assert!(out.contains("</weapons>"), "{out}");
+    // Children keep their real tag.
+    assert!(out.contains(r#"<ItemSpec id="101""#), "{out}");
+    // The document itself is untouched: a later plain SELECT still sees `arms`.
+    assert!(run_on_fixture("SELECT GROUP arms;").starts_with("<arms>"));
+}
+
+#[test]
+fn select_tag_as_alias_renames_every_match() {
+    let out = run_on_fixture("SELECT TAG ItemSpec AS Item;");
+    assert_eq!(out.matches("<Item ").count(), 7, "{out}");
+    assert!(!out.contains("<ItemSpec"), "{out}");
+}
+
+#[test]
+fn select_as_alias_applies_to_foreach_selected_elements() {
+    let out = run_on_fixture(
+        "SELECT GROUP goods AS stuff FOREACH good IN goods WHERE good.id > 52034301;",
+    );
+    assert!(out.contains(r#"<stuff id="52034302""#), "{out}");
+    assert!(out.contains(r#"<stuff id="52034307""#), "{out}");
+    assert!(!out.contains("<ItemSpec"), "{out}");
+}
+
+#[test]
+fn select_as_alias_applies_to_output_star() {
+    let out = run_on_fixture(
+        "SELECT GROUP goods AS stuff FOREACH good IN goods WHERE good.id = 52034301 OUTPUT *;",
+    );
+    assert!(out.contains(r#"<stuff id="52034301""#), "{out}");
+}
+
+#[test]
+fn rename_group_permanently_changes_the_tag() {
+    let out = run_on_fixture("RENAME GROUP arms AS weapons;\nSELECT GROUP weapons;");
+    assert!(out.contains("<weapons>"), "{out}");
+    assert!(!out.contains("<arms"), "{out}");
+    // The document itself was modified, so it's re-emitted in full too.
+    assert!(out.contains("<database>"), "{out}");
+}
+
+#[test]
+fn rename_tag_renames_every_matching_element() {
+    let out = run_on_fixture("RENAME TAG ItemSpec AS Item;");
+    assert!(!out.contains("<ItemSpec"), "{out}");
+    assert_eq!(out.matches("<Item ").count(), 7, "{out}");
+}
+
+#[test]
+fn rename_group_not_found_errors_without_ignore() {
+    let script = parse(&format!("USE {}\nRENAME GROUP nope AS x;", fixture_path())).unwrap();
+    let err = run(&script, None).unwrap_err();
+    assert!(err.message.contains("`nope` not found"), "{}", err.message);
+    // With IGNORE it is a no-op.
+    let out = run_on_fixture("RENAME IGNORE GROUP nope AS x;");
+    assert_eq!(out, "");
+}

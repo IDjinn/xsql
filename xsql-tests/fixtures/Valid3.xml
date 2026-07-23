@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<estados total="1" versao="1.15">
+	<estado uf="ac">
+		<cartorios total="1">
+			<cartorio codigo="00000000" comarca="000000">
+				<apresentantes total="1">
+					<apresentante codigo="123">
+						<nome>JOSE DA SILVA</nome>
+						<CPF>99446719089</CPF>
+						<tipo_apresentante>0</tipo_apresentante>
+						<titulos total="1">
+							<titulo id="0000000000">
+								<cedente>
+									<nome>JOSE DA SILVA</nome>
+								</cedente>
+								<sacador>
+									<nome>JOSE DA SILVA</nome>
+									<enderecos total="1">
+										<endereco>
+											<endereco>rua x</endereco>
+											<cep>04700000</cep>
+											<cidade>cidade</cidade>
+											<uf>ac</uf>
+										</endereco>
+									</enderecos>
+								</sacador>
+								<especie>DRI</especie>
+								<numero_titulo>321321321</numero_titulo>
+								<data_emissao>2018-12-31</data_emissao>
+								<data_vencimento>2019-01-31</data_vencimento>
+								<tipo_moeda>1</tipo_moeda>
+								<valor>15696666.12</valor>
+								<saldo>15696666.12</saldo>
+								<praca_protesto/>
+								<tipo_endosso>M</tipo_endosso>
+								<devedores total="1">
+									<devedor sequencia="1">
+										<nome>JOSE WITHOUT MONEY</nome>
+										<CPF>65093803073</CPF>
+										<intimado>true</intimado>
+										<edital>true</edital>
+										<edital_motivo>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras mattis mattis pharetra. Aenean ut enim turpis. In sed rhoncus nibh, ut rutrum neque. Aliquam maximus a metus in sagittis.</edital_motivo>
+										<enderecos total="1">
+											<endereco>
+												<endereco>rua x</endereco>
+												<cep>04700000</cep>
+												<cidade>cidade</cidade>
+												<uf>ac</uf>
+											</endereco>
+										</enderecos>
+									</devedor>
+								</devedores>
+								<data_apresentacao>2018-12-31</data_apresentacao>
+								<protocolo>43254564</protocolo>
+								<data_protocolo>2018-12-31</data_protocolo>
+								<ocorrencia>2</ocorrencia>
+								<data_ocorrencia>2018-12-31</data_ocorrencia>
+								<tipo_livro>1</tipo_livro>
+								<num_livro>1</num_livro>
+								<num_folha>1</num_folha>
+								<anuencia>
+									<flag>false</flag>
+								</anuencia>
+								<instrumento_eletronico/>
+							</titulo>
+						</titulos>
+					</apresentante>
+				</apresentantes>
+			</cartorio>
+		</cartorios>
+	</estado>
+</estados>

@@ -36,7 +36,7 @@ use crate::xml::dom::{Document, Element, NodeId};
 use crate::xml::parse::{parse_document_opts, parse_fragment_opts};
 #[cfg(feature = "simd")]
 use crate::xml::parse_simd::{parse_document_opts, parse_fragment_opts};
-use crate::xml::serialize::{escape_attr_into, serialize_document_opts, serialize_subtree_into};
+use crate::xml::serialize::{escape_attr_into, serialize_document_opts, serialize_subtree_as_into};
 
 use value::Value;
 
@@ -241,6 +241,7 @@ fn verb_label(verb: &Verb) -> &'static str {
         Verb::InsertInto { .. } => "INSERT",
         Verb::MergeInto { .. } => "MERGE",
         Verb::DeleteGroup { .. } | Verb::DeleteTag { .. } => "DELETE",
+        Verb::RenameGroup { .. } | Verb::RenameTag { .. } => "RENAME",
         Verb::Foreach(_) => "FOREACH",
     }
 }
@@ -398,7 +399,8 @@ struct BlockResult {
 
 fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<BlockResult> {
     match &block.verb {
-        Verb::Select { target, foreach } => {
+        Verb::Select { target, alias, foreach } => {
+            let alias = alias.as_deref();
             match foreach {
                 // `SELECT GROUP g` prints the group element itself;
                 // `SELECT TAG t` prints every matching element.
@@ -410,7 +412,7 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
                     };
                     let mut text = String::new();
                     for &id in &ids {
-                        serialize_subtree_into(doc, id, settings.format, &mut text);
+                        serialize_subtree_as_into(doc, id, settings.format, alias, &mut text);
                     }
                     Ok(BlockResult { output: Some(text), modified: false })
                 }
@@ -420,11 +422,11 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
                     // An OUTPUT op takes over what gets printed; without one
                     // the elements passing every WHERE print in full.
                     let text = if foreach_has_output(foreach) {
-                        render_emits(doc, &outcome.emits, settings)
+                        render_emits(doc, &outcome.emits, settings, alias)
                     } else {
                         let mut text = String::new();
                         for &id in &outcome.selected {
-                            serialize_subtree_into(doc, id, settings.format, &mut text);
+                            serialize_subtree_as_into(doc, id, settings.format, alias, &mut text);
                         }
                         text
                     };
@@ -440,7 +442,7 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
             let outcome = run_foreach(doc, elements, foreach)?;
             // A mutation loop with OUTPUT also prints its emissions.
             let output = foreach_has_output(foreach)
-                .then(|| render_emits(doc, &outcome.emits, settings));
+                .then(|| render_emits(doc, &outcome.emits, settings, None));
             Ok(BlockResult {
                 output,
                 modified: outcome.mutations > 0,
@@ -489,6 +491,28 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
             }
             for id in matches {
                 doc.detach(id);
+            }
+            Ok(BlockResult { output: None, modified: true })
+        }
+        Verb::RenameGroup { group, new_tag, ignore } => match doc.find_group(group) {
+            Some(id) => {
+                doc.node_mut(id).tag = new_tag.clone();
+                Ok(BlockResult { output: None, modified: true })
+            }
+            None if *ignore => Ok(BlockResult { output: None, modified: false }),
+            None => Err(group_not_found(group, block)),
+        },
+        Verb::RenameTag { tag, new_tag, ignore } => {
+            let matches = doc.find_tags(tag);
+            if matches.is_empty() {
+                return if *ignore {
+                    Ok(BlockResult { output: None, modified: false })
+                } else {
+                    Err(tag_not_found(tag, block))
+                };
+            }
+            for id in matches {
+                doc.node_mut(id).tag = new_tag.clone();
             }
             Ok(BlockResult { output: None, modified: true })
         }
@@ -840,12 +864,15 @@ fn render_aggregate(items: &[AggItem], contribs: &[Vec<Option<Value>>]) -> Strin
 
 /// Renders emissions in reach order. `Emit::Node` serializes after the
 /// mutations were applied, matching what a SELECT without OUTPUT prints.
-fn render_emits(doc: &Document, emits: &[Emit], settings: &Settings) -> String {
+/// `alias` (from `SELECT ... AS alias`) renames each `Emit::Node`'s outer
+/// tag on the way out; aggregate/attribute-row `Emit::Text` lines are
+/// unaffected (they carry no reusable tag).
+fn render_emits(doc: &Document, emits: &[Emit], settings: &Settings, alias: Option<&str>) -> String {
     let mut text = String::new();
     for emit in emits {
         match emit {
             Emit::Text(line) => text.push_str(line),
-            Emit::Node(id) => serialize_subtree_into(doc, *id, settings.format, &mut text),
+            Emit::Node(id) => serialize_subtree_as_into(doc, *id, settings.format, alias, &mut text),
         }
     }
     text

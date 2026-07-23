@@ -46,7 +46,7 @@ pub fn serialize_document_opts(doc: &Document, pretty: bool) -> String {
         out.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     }
     for &root in &doc.roots {
-        serialize_node(doc, root, 0, pretty, &mut out);
+        serialize_node(doc, root, 0, pretty, None, &mut out);
         if !pretty {
             out.push('\n');
         }
@@ -68,15 +68,36 @@ pub fn serialize_subtree_opts(doc: &Document, id: NodeId, pretty: bool) -> Strin
 /// Appends one subtree to an existing buffer (lets callers that render many
 /// subtrees reuse a single pre-reserved string).
 pub fn serialize_subtree_into(doc: &Document, id: NodeId, pretty: bool, out: &mut String) {
+    serialize_subtree_as_into(doc, id, pretty, None, out)
+}
+
+/// Like [`serialize_subtree_into`], but `tag` (when given) replaces the
+/// outermost element's tag on the way out — a display-only rename (`SELECT
+/// ... AS alias`); descendants keep their real tags.
+pub fn serialize_subtree_as_into(
+    doc: &Document,
+    id: NodeId,
+    pretty: bool,
+    tag: Option<&str>,
+    out: &mut String,
+) {
     out.reserve(estimate_subtree_len(doc, id));
-    serialize_node(doc, id, 0, pretty, out);
+    serialize_node(doc, id, 0, pretty, tag, out);
     if !pretty {
         out.push('\n');
     }
 }
 
-fn serialize_node(doc: &Document, id: NodeId, depth: usize, pretty: bool, out: &mut String) {
+fn serialize_node(
+    doc: &Document,
+    id: NodeId,
+    depth: usize,
+    pretty: bool,
+    tag_override: Option<&str>,
+    out: &mut String,
+) {
     let el = doc.node(id);
+    let tag = tag_override.unwrap_or(&el.tag);
     if pretty {
         for _ in 0..depth {
             out.push_str(INDENT);
@@ -92,7 +113,7 @@ fn serialize_node(doc: &Document, id: NodeId, depth: usize, pretty: bool, out: &
         return;
     }
     out.push('<');
-    out.push_str(&el.tag);
+    out.push_str(tag);
     for (k, v) in &el.attrs {
         out.push(' ');
         out.push_str(k);
@@ -130,7 +151,7 @@ fn serialize_node(doc: &Document, id: NodeId, depth: usize, pretty: bool, out: &
             }
         }
         for &child in &el.children {
-            serialize_node(doc, child, depth + 1, pretty, out);
+            serialize_node(doc, child, depth + 1, pretty, None, out);
         }
         if pretty {
             for _ in 0..depth {
@@ -139,7 +160,7 @@ fn serialize_node(doc: &Document, id: NodeId, depth: usize, pretty: bool, out: &
         }
     }
     out.push_str("</");
-    out.push_str(&el.tag);
+    out.push_str(tag);
     out.push('>');
     if pretty {
         out.push('\n');

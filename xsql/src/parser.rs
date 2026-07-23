@@ -247,6 +247,11 @@ impl Parser {
             Tok::Select => {
                 self.bump();
                 let target = self.selector("after SELECT")?;
+                let alias = if self.eat(&Tok::As) {
+                    Some(self.tag_name("after AS")?)
+                } else {
+                    None
+                };
                 let foreach = if self.peek() == &Tok::Foreach {
                     Some(self.foreach()?)
                 } else if self.peek() == &Tok::Output {
@@ -263,7 +268,7 @@ impl Parser {
                 } else {
                     None
                 };
-                Ok(Verb::Select { target, foreach })
+                Ok(Verb::Select { target, alias, foreach })
             }
             Tok::Replace => {
                 self.bump();
@@ -324,9 +329,25 @@ impl Parser {
                 }
             }
             Tok::Foreach => Ok(Verb::Foreach(self.foreach()?)),
+            Tok::Rename => {
+                self.bump();
+                let ignore = self.eat(&Tok::Ignore);
+                if self.eat(&Tok::Tag) {
+                    let tag = self.group_name()?;
+                    self.expect(Tok::As, "after RENAME TAG name")?;
+                    let new_tag = self.tag_name("as the new tag name")?;
+                    Ok(Verb::RenameTag { tag, new_tag, ignore })
+                } else {
+                    self.expect(Tok::Group, "after RENAME")?;
+                    let group = self.group_name()?;
+                    self.expect(Tok::As, "after RENAME GROUP name")?;
+                    let new_tag = self.tag_name("as the new tag name")?;
+                    Ok(Verb::RenameGroup { group, new_tag, ignore })
+                }
+            }
             other => Err(XsqlError::spanned(
                 format!(
-                    "expected SELECT, REPLACE, INSERT, MERGE, UPDATE, DELETE or FOREACH after USE, found {}",
+                    "expected SELECT, REPLACE, INSERT, MERGE, UPDATE, DELETE, RENAME or FOREACH after USE, found {}",
                     other.describe()
                 ),
                 span,
@@ -473,6 +494,28 @@ impl Parser {
             }
             other => Err(XsqlError::spanned(
                 format!("expected group name (identifier, number or quoted string), found {}", other.describe()),
+                span,
+            )),
+        }
+    }
+
+    /// A tag name for an `AS` alias or `RENAME ... AS` target: an identifier
+    /// or a quoted string (for names that collide with keywords). Unlike
+    /// [`Self::group_name`], bare numbers are rejected — XML tag names can't
+    /// start with a digit.
+    fn tag_name(&mut self, context: &str) -> Result<String> {
+        let span = self.span();
+        match self.peek().clone() {
+            Tok::Ident(name) => {
+                self.bump();
+                Ok(name)
+            }
+            Tok::Str(name) => {
+                self.bump();
+                Ok(name)
+            }
+            other => Err(XsqlError::spanned(
+                format!("expected tag name (identifier or quoted string) {context}, found {}", other.describe()),
                 span,
             )),
         }

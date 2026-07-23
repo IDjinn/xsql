@@ -42,7 +42,7 @@ FOREACH office IN office
 
     assert_eq!(script.blocks.len(), 4);
 
-    let Verb::Select { target, foreach } = &script.blocks[0].verb else {
+    let Verb::Select { target, foreach, .. } = &script.blocks[0].verb else {
         panic!("block 0 should be SELECT");
     };
     assert_eq!(target, &Selector::Group("arms".into()));
@@ -291,7 +291,7 @@ fn tag_selector_parses_everywhere() {
     .unwrap();
     assert!(matches!(
         &script.blocks[0].verb,
-        Verb::Select { target: Selector::Tag(t), foreach: None } if t == "ItemSpec"
+        Verb::Select { target: Selector::Tag(t), foreach: None, .. } if t == "ItemSpec"
     ));
     let Verb::Foreach(f) = &script.blocks[1].verb else { panic!() };
     assert_eq!(f.source, LoopSource::Tag("ItemSpec".into()));
@@ -311,7 +311,7 @@ fn root_selector_parses_everywhere() {
     .unwrap();
     assert!(matches!(
         &script.blocks[0].verb,
-        Verb::Select { target: Selector::Root, foreach: None }
+        Verb::Select { target: Selector::Root, foreach: None, .. }
     ));
     let Verb::Foreach(f) = &script.blocks[1].verb else { panic!() };
     assert_eq!(f.source, LoopSource::Root);
@@ -349,4 +349,70 @@ fn limit_other_than_one_is_an_error() {
 fn delete_from_rejects_ignore() {
     let err = parse("USE db.xml\nDELETE IGNORE FROM goods;").unwrap_err();
     assert!(err.message.contains("IGNORE is not supported"), "{}", err.message);
+}
+
+#[test]
+fn select_as_alias_parses_for_group_tag_and_root() {
+    let script = parse(
+        "USE db.xml\nSELECT GROUP arms AS weapons;\nSELECT TAG ItemSpec AS Item;\nSELECT ROOT AS anything;",
+    )
+    .unwrap();
+    assert!(matches!(
+        &script.blocks[0].verb,
+        Verb::Select { target: Selector::Group(g), alias: Some(a), foreach: None }
+            if g == "arms" && a == "weapons"
+    ));
+    assert!(matches!(
+        &script.blocks[1].verb,
+        Verb::Select { target: Selector::Tag(t), alias: Some(a), foreach: None }
+            if t == "ItemSpec" && a == "Item"
+    ));
+    assert!(matches!(
+        &script.blocks[2].verb,
+        Verb::Select { target: Selector::Root, alias: Some(a), foreach: None } if a == "anything"
+    ));
+}
+
+#[test]
+fn select_as_alias_composes_with_foreach() {
+    let script =
+        parse("USE db.xml\nSELECT GROUP goods AS stuff FOREACH g IN goods WHERE g.cost > 5;")
+            .unwrap();
+    let Verb::Select { alias: Some(a), foreach: Some(f), .. } = &script.blocks[0].verb else {
+        panic!("expected SELECT ... AS alias FOREACH ...")
+    };
+    assert_eq!(a, "stuff");
+    assert!(matches!(&f.ops[0], Op::Where(_)));
+}
+
+#[test]
+fn select_without_as_has_no_alias() {
+    let script = parse("USE db.xml\nSELECT GROUP arms;").unwrap();
+    assert!(matches!(&script.blocks[0].verb, Verb::Select { alias: None, .. }));
+}
+
+#[test]
+fn rename_group_and_tag_parse() {
+    let script = parse(
+        "USE db.xml\nRENAME GROUP arms AS weapons;\nRENAME TAG ItemSpec AS Item;\nRENAME IGNORE GROUP missing AS x;",
+    )
+    .unwrap();
+    assert!(matches!(
+        &script.blocks[0].verb,
+        Verb::RenameGroup { group, new_tag, ignore: false } if group == "arms" && new_tag == "weapons"
+    ));
+    assert!(matches!(
+        &script.blocks[1].verb,
+        Verb::RenameTag { tag, new_tag, ignore: false } if tag == "ItemSpec" && new_tag == "Item"
+    ));
+    assert!(matches!(
+        &script.blocks[2].verb,
+        Verb::RenameGroup { group, ignore: true, .. } if group == "missing"
+    ));
+}
+
+#[test]
+fn rename_requires_as() {
+    let err = parse("USE db.xml\nRENAME GROUP arms weapons;").unwrap_err();
+    assert!(err.message.contains("AS"), "{}", err.message);
 }
