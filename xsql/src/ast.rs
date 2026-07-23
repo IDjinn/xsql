@@ -87,19 +87,23 @@ impl Source {
 }
 
 /// What a verb operates on: a *group* (first element matched by tag, `name`
-/// or `id` attribute — a container whose children are iterated) or a *tag*
+/// or `id` attribute — a container whose children are iterated), a *tag*
 /// (every element with that tag name, wherever it sits — for documents
-/// without a regular group structure).
+/// without a regular group structure), or the document *root* (every
+/// element regardless of tag — for documents whose tag names aren't known
+/// ahead of time).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     Group(String),
     Tag(String),
+    Root,
 }
 
 impl Selector {
     pub fn name(&self) -> &str {
         match self {
             Selector::Group(name) | Selector::Tag(name) => name,
+            Selector::Root => "root",
         }
     }
 }
@@ -141,12 +145,17 @@ pub enum LoopSource {
     /// `IN TAG t` — every element with tag `t`: document-wide at top level,
     /// within the current element's subtree when nested.
     Tag(String),
+    /// `IN ROOT` — every element regardless of tag: document-wide at top
+    /// level, within the current element's subtree when nested. For
+    /// documents/subtrees whose tag names aren't known ahead of time.
+    Root,
 }
 
 impl LoopSource {
     pub fn name(&self) -> &str {
         match self {
             LoopSource::Name(name) | LoopSource::Tag(name) => name,
+            LoopSource::Root => "root",
         }
     }
 }
@@ -233,6 +242,14 @@ pub enum Expr {
     },
     Not(Box<Expr>, Span),
     Neg(Box<Expr>, Span),
+    /// `FUNC(expr)` — an aggregate function call (`COUNT`, `MIN`, `MAX`,
+    /// `SUM`, `AVG`). Only valid as an `OUTPUT` item; evaluated across every
+    /// element the loop reaches, not per element.
+    Call {
+        func: String,
+        arg: Box<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

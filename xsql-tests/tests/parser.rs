@@ -1,4 +1,4 @@
-use xsql::ast::{LoopSource, Op, Selector, Setting, Settings, Source, Verb};
+use xsql::ast::{Expr, LoopSource, Op, Selector, Setting, Settings, Source, Verb};
 use xsql::parser::parse;
 
 /// The four scripts from the original scratch file must parse verbatim.
@@ -191,7 +191,7 @@ fn expression_precedence() {
 #[test]
 fn parse_error_reports_span() {
     let err = parse("USE db.xml\nSELECT arms;").unwrap_err();
-    assert!(err.message.contains("expected GROUP or TAG"), "{}", err.message);
+    assert!(err.message.contains("expected GROUP, TAG or ROOT"), "{}", err.message);
     assert_eq!(err.span.unwrap().line, 2);
 }
 
@@ -301,6 +301,32 @@ fn tag_selector_parses_everywhere() {
     ));
     let Verb::Foreach(f) = &script.blocks[3].verb else { panic!() };
     assert_eq!(f.source, LoopSource::Tag("ItemSpec".into()));
+}
+
+#[test]
+fn root_selector_parses_everywhere() {
+    let script = parse(
+        "USE db.xml\nSELECT ROOT;\nFOREACH i IN ROOT SET i.seen = 1;\nUPDATE ROOT SET cost = 0;",
+    )
+    .unwrap();
+    assert!(matches!(
+        &script.blocks[0].verb,
+        Verb::Select { target: Selector::Root, foreach: None }
+    ));
+    let Verb::Foreach(f) = &script.blocks[1].verb else { panic!() };
+    assert_eq!(f.source, LoopSource::Root);
+    let Verb::Foreach(f) = &script.blocks[2].verb else { panic!() };
+    assert_eq!(f.source, LoopSource::Root);
+}
+
+#[test]
+fn aggregate_function_call_parses_as_expr_call() {
+    let script = parse("USE db.xml\nFOREACH v IN g OUTPUT COUNT(v.id);").unwrap();
+    let Verb::Foreach(f) = &script.blocks[0].verb else { panic!() };
+    let Op::Output { items, .. } = &f.ops[0] else { panic!() };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].1, "count");
+    assert!(matches!(&items[0].0, Expr::Call { func, .. } if func == "COUNT"));
 }
 
 #[test]

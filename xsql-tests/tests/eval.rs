@@ -615,3 +615,100 @@ fn foreach_tag_handles_nested_matches() {
     assert!(out.contains(r#"<Item id="1" n="11">"#), "{out}");
     assert!(out.contains(r#"<Item id="2" n="12"/>"#), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// ROOT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn foreach_in_root_iterates_every_element_regardless_of_tag() {
+    let xml = r#"<db>
+        <a><ItemSpec id="1" type="0"/></a>
+        <b><ItemSpec id="2" type="1"/></b>
+        <c><ItemSpec id="3" type="0"/></c>
+    </db>"#;
+    let script = parse("USE INPUT\nFOREACH v IN ROOT WHERE v.type = 0 OUTPUT v.id;").unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert_eq!(out, "<ItemSpec id=\"1\"/>\n<ItemSpec id=\"3\"/>\n");
+}
+
+#[test]
+fn select_root_prints_every_element() {
+    let xml = r#"<db><a><Item id="1"/></a></db>"#;
+    let script = parse("USE INPUT\nSELECT ROOT OUTPUT id;").unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    // db, a and Item all show up (db/a have no `id`, so their tag prints bare).
+    assert!(out.contains("<db/>"), "{out}");
+    assert!(out.contains("<a/>"), "{out}");
+    assert!(out.contains(r#"<Item id="1"/>"#), "{out}");
+}
+
+#[test]
+fn nested_foreach_in_root_stays_within_subtree() {
+    let xml = r#"<db><a><wrap><Item v="1"/></wrap><Item v="2"/></a><b><Item v="3"/></b></db>"#;
+    let script = parse(
+        "USE INPUT\nFOREACH outer IN TAG a\n    FOREACH i IN ROOT\n        SET i.hit = 1\n;",
+    )
+    .unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    // Every element under <a> is hit (wrap and both Items), nothing under <b>.
+    assert_eq!(out.matches(r#"hit="1""#).count(), 3, "{out}");
+    assert!(out.contains(r#"<Item v="3"/>"#), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate OUTPUT functions
+// ---------------------------------------------------------------------------
+
+fn aggregate_fixture() -> &'static str {
+    r#"<db>
+        <ItemSpec id="1" type="0" cost="10"/>
+        <ItemSpec id="2" type="1" cost="20"/>
+        <ItemSpec id="3" type="0" cost="30"/>
+    </db>"#
+}
+
+#[test]
+fn output_count_returns_plain_number() {
+    let script = parse(
+        "USE INPUT\nFOREACH v IN TAG ItemSpec WHERE v.type = 0 OUTPUT COUNT(v.id);",
+    )
+    .unwrap();
+    let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn output_min_max_sum_avg_in_one_row() {
+    let script = parse(
+        "USE INPUT\nFOREACH v IN TAG ItemSpec WHERE v.type = 0 \
+         OUTPUT MIN(v.cost), MAX(v.cost), SUM(v.cost), AVG(v.cost);",
+    )
+    .unwrap();
+    let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
+    assert_eq!(out, "10,30,40,20\n");
+}
+
+#[test]
+fn output_count_with_zero_matches_is_zero() {
+    let script = parse(
+        "USE INPUT\nFOREACH v IN TAG ItemSpec WHERE v.type = 99 OUTPUT COUNT(v.id);",
+    )
+    .unwrap();
+    let out = run(&script, Some(aggregate_fixture().to_string())).unwrap();
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn output_cannot_mix_aggregate_and_plain_items() {
+    let script = parse("USE INPUT\nFOREACH v IN TAG ItemSpec OUTPUT v.id, COUNT(v.id);").unwrap();
+    let err = run(&script, Some(aggregate_fixture().to_string())).unwrap_err();
+    assert!(err.message.contains("cannot mix aggregate functions"), "{}", err.message);
+}
+
+#[test]
+fn output_unknown_aggregate_function_errors() {
+    let script = parse("USE INPUT\nFOREACH v IN TAG ItemSpec OUTPUT NOPE(v.id);").unwrap();
+    let err = run(&script, Some(aggregate_fixture().to_string())).unwrap_err();
+    assert!(err.message.contains("unknown aggregate function `NOPE`"), "{}", err.message);
+}

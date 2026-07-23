@@ -12,9 +12,9 @@
 //!    sequential (a BREAK inside a nested FOREACH only ends that inner loop,
 //!    so it doesn't force sequential execution). Nested loops only ever
 //!    touch the current top-level child's subtree, which is what keeps the
-//!    parallel planning safe. TAG-based loops may match nested elements;
-//!    they only run parallel after a disjointness check (no match is an
-//!    ancestor of another) — otherwise they stay sequential.
+//!    parallel planning safe. TAG- and ROOT-based loops may match nested
+//!    elements; they only run parallel after a disjointness check (no match
+//!    is an ancestor of another) — otherwise they stay sequential.
 //! 4. Modified documents are serialized in parallel and appended to the
 //!    output in first-use order.
 //!
@@ -406,6 +406,7 @@ fn run_block(doc: &mut Document, block: &Block, settings: &Settings) -> Result<B
                     let ids = match target {
                         Selector::Group(group) => vec![resolve_group(doc, group, block)?],
                         Selector::Tag(tag) => resolve_tags(doc, tag, block)?,
+                        Selector::Root => doc.all_elements(),
                     };
                     let mut text = String::new();
                     for &id in &ids {
@@ -544,6 +545,7 @@ fn loop_elements(doc: &Document, source: &LoopSource, block: &Block) -> Result<L
         LoopSource::Tag(tag) => {
             Ok(LoopElems { elems: resolve_tags(doc, tag, block)?, disjoint: false })
         }
+        LoopSource::Root => Ok(LoopElems { elems: doc.all_elements(), disjoint: false }),
     }
 }
 
@@ -556,6 +558,7 @@ fn select_elements(doc: &Document, target: &Selector, block: &Block) -> Result<L
         Selector::Tag(tag) => {
             Ok(LoopElems { elems: resolve_tags(doc, tag, block)?, disjoint: false })
         }
+        Selector::Root => Ok(LoopElems { elems: doc.all_elements(), disjoint: false }),
     }
 }
 
@@ -682,12 +685,19 @@ struct ChildPlan {
     broke: bool,
     actions: Vec<(NodeId, Action)>,
     emits: Vec<Emit>,
+    /// One entry per reach of an aggregate `OUTPUT` (usually zero or one;
+    /// more than one if the aggregate OUTPUT sits inside a nested loop).
+    /// Each entry has one slot per aggregate item, `None` when that item's
+    /// argument was missing/non-numeric on that reach (skipped, like a null
+    /// attribute elsewhere in the language).
+    agg_contribs: Vec<Vec<Option<f64>>>,
 }
 
 struct ForeachOutcome {
     selected: Vec<NodeId>,
     emits: Vec<Emit>,
     mutations: usize,
+    agg_contribs: Vec<Vec<Option<f64>>>,
 }
 
 /// Whether the loop (or any nested loop) contains an OUTPUT op — when it
@@ -698,6 +708,103 @@ fn foreach_has_output(foreach: &Foreach) -> bool {
         Op::Foreach(inner) => foreach_has_output(inner),
         _ => false,
     })
+}
+
+/// Collects every `OUTPUT` op in a foreach, including inside nested loops.
+fn collect_outputs<'a>(foreach: &'a Foreach, out: &mut Vec<&'a Op>) {
+    for op in &foreach.ops {
+        match op {
+            Op::Output { .. } => out.push(op),
+            Op::Foreach(inner) => collect_outputs(inner, out),
+            _ => {}
+        }
+    }
+}
+
+/// If this foreach's only `OUTPUT` is a pure-aggregate one (every item a
+/// `COUNT`/`MIN`/`MAX`/`SUM`/`AVG` call), returns its `(function, name)`
+/// list. A `None` OUTPUT (absent, or plain) means no aggregate handling is
+/// needed. Mixing an aggregate OUTPUT with any other OUTPUT — aggregate or
+/// plain — in the same foreach is rejected: there's no single row for a
+/// per-element OUTPUT and a whole-loop aggregate to share.
+fn aggregate_output(foreach: &Foreach) -> Result<Option<Vec<(String, String)>>> {
+    let mut outputs = Vec::new();
+    collect_outputs(foreach, &mut outputs);
+    let is_agg = |items: &[(Expr, String)]| items.iter().any(|(e, _)| matches!(e, Expr::Call { .. }));
+    match outputs.as_slice() {
+        [Op::Output { items, span, .. }] if is_agg(items) => {
+            if !items.iter().all(|(e, _)| matches!(e, Expr::Call { .. })) {
+                return Err(XsqlError::spanned(
+                    "cannot mix aggregate functions with plain attributes/expressions \
+                     in the same OUTPUT",
+                    *span,
+                ));
+            }
+            let mut names = Vec::with_capacity(items.len());
+            for (expr, name) in items {
+                let Expr::Call { func, span: call_span, .. } = expr else { unreachable!() };
+                let func = func.to_ascii_uppercase();
+                if !matches!(func.as_str(), "COUNT" | "MIN" | "MAX" | "SUM" | "AVG") {
+                    return Err(XsqlError::spanned(
+                        format!("unknown aggregate function `{func}` (known: COUNT, MIN, MAX, SUM, AVG)"),
+                        *call_span,
+                    ));
+                }
+                names.push((func, name.clone()));
+            }
+            Ok(Some(names))
+        }
+        outs if outs.iter().any(|op| {
+            matches!(op, Op::Output { items, .. } if is_agg(items))
+        }) =>
+        {
+            let span = outs
+                .iter()
+                .find_map(|op| match op {
+                    Op::Output { items, span, .. } if is_agg(items) => Some(*span),
+                    _ => None,
+                })
+                .expect("checked above");
+            Err(XsqlError::spanned(
+                "an aggregate OUTPUT (COUNT/MIN/MAX/SUM/AVG) must be the only OUTPUT in its FOREACH",
+                span,
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Combines every reach's per-item contribution into the loop's final
+/// aggregate values, formatted as a comma-joined line (no XML — the whole
+/// point of an aggregate OUTPUT is a bare number). Aliases are not printed:
+/// with a single row there is nothing to disambiguate. A function with zero
+/// contributing rows (loop matched nothing, or every value was non-numeric)
+/// reports `0`.
+fn render_aggregate(items: &[(String, String)], contribs: &[Vec<Option<f64>>]) -> String {
+    let mut parts = Vec::with_capacity(items.len());
+    for (i, (func, _name)) in items.iter().enumerate() {
+        let values: Vec<f64> = contribs
+            .iter()
+            .filter_map(|reach| reach.get(i).copied().flatten())
+            .collect();
+        let result = match func.as_str() {
+            "COUNT" => values.len() as f64,
+            "SUM" => values.iter().sum(),
+            "AVG" => {
+                if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().sum::<f64>() / values.len() as f64
+                }
+            }
+            "MIN" => values.iter().copied().fold(f64::INFINITY, f64::min),
+            "MAX" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            _ => unreachable!("validated by aggregate_output"),
+        };
+        let result = if !result.is_finite() { 0.0 } else { result };
+        parts.push(Value::Num(result).to_display());
+    }
+    parts.join(",") + "\n"
 }
 
 /// Renders emissions in reach order. `Emit::Node` serializes after the
@@ -720,8 +827,14 @@ fn run_foreach(
 ) -> Result<ForeachOutcome> {
     let LoopElems { elems: children, disjoint } = elements;
     let has_break = foreach.ops.iter().any(|op| matches!(op, Op::Break));
+    let agg = aggregate_output(foreach)?;
 
-    let mut outcome = ForeachOutcome { selected: Vec::new(), emits: Vec::new(), mutations: 0 };
+    let mut outcome = ForeachOutcome {
+        selected: Vec::new(),
+        emits: Vec::new(),
+        mutations: 0,
+        agg_contribs: Vec::new(),
+    };
 
     // Parallel planning requires disjoint subtrees; tag matches only get the
     // (linear) ancestor check once the loop is big enough to parallelize.
@@ -749,6 +862,10 @@ fn run_foreach(
         }
     }
 
+    if let Some(items) = agg {
+        outcome.emits.push(Emit::Text(render_aggregate(&items, &outcome.agg_contribs)));
+    }
+
     Ok(outcome)
 }
 
@@ -771,6 +888,7 @@ fn apply_plan(doc: &mut Document, child: NodeId, plan: ChildPlan, outcome: &mut 
         outcome.selected.push(child);
     }
     outcome.emits.extend(plan.emits);
+    outcome.agg_contribs.extend(plan.agg_contribs);
 }
 
 /// One enclosing FOREACH binding during planning: the names resolving to
@@ -828,6 +946,7 @@ fn plan_child(doc: &Document, child: NodeId, foreach: &Foreach) -> Result<ChildP
     let mut scopes = Vec::new();
     let mut actions = Vec::new();
     let mut emits = Vec::new();
+    let mut agg_contribs = Vec::new();
     let (selected, broke) = plan_element(
         doc,
         child,
@@ -836,8 +955,9 @@ fn plan_child(doc: &Document, child: NodeId, foreach: &Foreach) -> Result<ChildP
         &mut scopes,
         &mut actions,
         &mut emits,
+        &mut agg_contribs,
     )?;
-    Ok(ChildPlan { selected, broke, actions, emits })
+    Ok(ChildPlan { selected, broke, actions, emits, agg_contribs })
 }
 
 /// Plans one element of a loop (recursing into nested FOREACH), read-only.
@@ -851,19 +971,22 @@ fn plan_element<'a>(
     scopes: &mut Vec<Scope<'a>>,
     actions: &mut Vec<(NodeId, Action)>,
     emits: &mut Vec<Emit>,
+    agg_contribs: &mut Vec<Vec<Option<f64>>>,
 ) -> Result<(bool, bool)> {
     scopes.push(Scope { var: &foreach.var, alias, node, changes: Vec::new() });
-    let result = plan_ops(doc, foreach, scopes, actions, emits);
+    let result = plan_ops(doc, foreach, scopes, actions, emits, agg_contribs);
     scopes.pop();
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_ops<'a>(
     doc: &Document,
     foreach: &'a Foreach,
     scopes: &mut Vec<Scope<'a>>,
     actions: &mut Vec<(NodeId, Action)>,
     emits: &mut Vec<Emit>,
+    agg_contribs: &mut Vec<Vec<Option<f64>>>,
 ) -> Result<(bool, bool)> {
     let mut selected = true;
     for (op_idx, op) in foreach.ops.iter().enumerate() {
@@ -941,17 +1064,52 @@ fn plan_ops<'a>(
             Op::Foreach(inner) => {
                 let (kids, inner_alias) = resolve_loop_elems(doc, scopes, inner)?;
                 for kid in kids {
-                    let (_, broke) =
-                        plan_element(doc, kid, inner, inner_alias, scopes, actions, emits)?;
+                    let (_, broke) = plan_element(
+                        doc,
+                        kid,
+                        inner,
+                        inner_alias,
+                        scopes,
+                        actions,
+                        emits,
+                        agg_contribs,
+                    )?;
                     if broke {
                         break;
                     }
                 }
             }
-            Op::Output { all, items, span: _ } => {
+            Op::Output { all, items, span } => {
                 let node = scopes.last().expect("OUTPUT has an enclosing scope").node;
                 if *all {
                     emits.push(Emit::Node(node));
+                } else if items.iter().any(|(e, _)| matches!(e, Expr::Call { .. })) {
+                    if !items.iter().all(|(e, _)| matches!(e, Expr::Call { .. })) {
+                        return Err(XsqlError::spanned(
+                            "cannot mix aggregate functions with plain attributes/expressions \
+                             in the same OUTPUT",
+                            *span,
+                        ));
+                    }
+                    let mut reach = Vec::with_capacity(items.len());
+                    for (expr, _name) in items {
+                        let Expr::Call { func, arg, span } = expr else { unreachable!() };
+                        let value = eval_expr(doc, arg, scopes)?;
+                        reach.push(match func.to_ascii_uppercase().as_str() {
+                            "COUNT" => (!matches!(value, Value::Null)).then_some(1.0),
+                            "MIN" | "MAX" | "SUM" | "AVG" => value.as_num(),
+                            other => {
+                                return Err(XsqlError::spanned(
+                                    format!(
+                                        "unknown aggregate function `{other}` \
+                                         (known: COUNT, MIN, MAX, SUM, AVG)"
+                                    ),
+                                    *span,
+                                ));
+                            }
+                        });
+                    }
+                    agg_contribs.push(reach);
                 } else {
                     // Rendered at reach time from the overlay: SETs before
                     // the OUTPUT are visible, later ones are not. Missing
@@ -982,7 +1140,8 @@ fn plan_ops<'a>(
 /// what keeps parallel planning of sibling elements safe). `IN TAG t`
 /// iterates every element with tag `t` inside the current element's subtree
 /// (zero matches simply iterate nothing — heterogeneous documents are the
-/// whole point of TAG).
+/// whole point of TAG). `IN ROOT` is the same, but with no tag filter at
+/// all — for subtrees whose tag names aren't known ahead of time.
 fn resolve_loop_elems<'a>(
     doc: &Document,
     scopes: &[Scope],
@@ -1006,6 +1165,7 @@ fn resolve_loop_elems<'a>(
             }
         }
         LoopSource::Tag(tag) => Ok((doc.find_tags_within(current, tag), tag.as_str())),
+        LoopSource::Root => Ok((doc.all_elements_within(current), "root")),
     }
 }
 
@@ -1086,6 +1246,10 @@ fn eval_expr(doc: &Document, expr: &Expr, scopes: &[Scope]) -> Result<Value> {
             };
             Ok(value)
         }
+        Expr::Call { func, span, .. } => Err(XsqlError::spanned(
+            format!("`{func}(...)` is an aggregate function: it can only be used as a direct OUTPUT item"),
+            *span,
+        )),
     }
 }
 

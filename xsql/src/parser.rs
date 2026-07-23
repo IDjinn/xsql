@@ -334,7 +334,7 @@ impl Parser {
         }
     }
 
-    /// `GROUP <name>` or `TAG <name>`.
+    /// `GROUP <name>`, `TAG <name>` or `ROOT`.
     fn selector(&mut self, context: &str) -> Result<Selector> {
         match self.peek() {
             Tok::Group => {
@@ -345,18 +345,24 @@ impl Parser {
                 self.bump();
                 Ok(Selector::Tag(self.group_name()?))
             }
+            Tok::Root => {
+                self.bump();
+                Ok(Selector::Root)
+            }
             other => Err(XsqlError::spanned(
-                format!("expected GROUP or TAG {context}, found {}", other.describe()),
+                format!("expected GROUP, TAG or ROOT {context}, found {}", other.describe()),
                 self.span(),
             )),
         }
     }
 
-    /// Shorthand target: `TAG t` or `[GROUP] g` (the GROUP keyword is
+    /// Shorthand target: `TAG t`, `ROOT` or `[GROUP] g` (the GROUP keyword is
     /// optional, matching MySQL's bare table name).
     fn shorthand_source(&mut self) -> Result<LoopSource> {
         if self.eat(&Tok::Tag) {
             Ok(LoopSource::Tag(self.group_name()?))
+        } else if self.eat(&Tok::Root) {
+            Ok(LoopSource::Root)
         } else {
             self.eat(&Tok::Group);
             Ok(LoopSource::Name(self.group_name()?))
@@ -501,6 +507,8 @@ impl Parser {
         self.expect(Tok::In, "after the loop variable")?;
         let source = if self.eat(&Tok::Tag) {
             LoopSource::Tag(self.group_name()?)
+        } else if self.eat(&Tok::Root) {
+            LoopSource::Root
         } else {
             LoopSource::Name(self.group_name()?)
         };
@@ -606,6 +614,7 @@ impl Parser {
             let name = match (alias, &expr) {
                 (Some(name), _) => name,
                 (None, Expr::Attr { attr, .. }) => attr.clone(),
+                (None, Expr::Call { func, .. }) => func.to_ascii_lowercase(),
                 (None, _) => {
                     return Err(XsqlError::spanned(
                         "an OUTPUT expression needs a name: add `AS <name>`",
@@ -727,6 +736,11 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 self.bump();
+                if self.eat(&Tok::LParen) {
+                    let arg = self.expr()?;
+                    self.expect(Tok::RParen, "to close the function call")?;
+                    return Ok(Expr::Call { func: name, arg: Box::new(arg), span });
+                }
                 match name.split_once('.') {
                     Some((var, attr)) => Ok(Expr::Attr {
                         var: var.to_string(),
@@ -759,6 +773,7 @@ fn selector_source(target: &Selector) -> LoopSource {
     match target {
         Selector::Group(name) => LoopSource::Name(name.clone()),
         Selector::Tag(name) => LoopSource::Tag(name.clone()),
+        Selector::Root => LoopSource::Root,
     }
 }
 

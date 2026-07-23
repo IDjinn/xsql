@@ -139,6 +139,21 @@ FOREACH office IN offices
         SET m.office = office.id
 ;
 
+; ROOT is like TAG but with no tag filter at all: every element in the
+; document, any tag — for when you don't know (or don't want to name) the
+; tag ahead of time. Same document-wide/nested-subtree rule as TAG.
+FOREACH v IN ROOT WHERE v.type = 0 OUTPUT v.id;
+UPDATE ROOT SET reviewed = 1 WHERE cost > 500;
+
+; aggregate OUTPUT: COUNT/MIN/MAX/SUM/AVG summarize the whole loop into one
+; row of bare numbers instead of one row per element — no XML wrapper.
+; A pure-aggregate OUTPUT must be the loop's only OUTPUT (no mixing with
+; plain attributes/expressions); zero contributing rows reports 0.
+FOREACH v IN ItemSpec WHERE v.type = 0 OUTPUT COUNT(v.id);              ; -> 2
+FOREACH v IN ItemSpec WHERE v.type = 0
+    OUTPUT MIN(v.cost), MAX(v.cost), SUM(v.cost), AVG(v.cost)
+;                                                                        ; -> 10,30,40,20
+
 ; more verbs
 INSERT INTO GROUP goods RAW XML `<ItemSpec id="999"/>`;
 DELETE GROUP legacy_stuff;
@@ -161,11 +176,13 @@ ANALYZE;                   print per-stage timings to stderr
 | `DELETE [IGNORE] GROUP g` | removes the whole group element |
 | `DELETE [IGNORE] TAG t` | removes every element with tag `t` (`IGNORE`: no error when none match) |
 | `SELECT TAG t [FOREACH ...\|OUTPUT ...]` | prints every element with tag `t`, wherever it sits |
-| `UPDATE (TAG t \| [GROUP] g) SET a = e, ... [WHERE expr] [LIMIT 1]` | MySQL-style sugar for a FOREACH: guard, then the SETs; `LIMIT 1` = BREAK after the first match |
-| `MERGE (TAG t \| [GROUP] g) SET a = e, ... [WHERE expr] [LIMIT 1]` | same, but attributes are written only where missing (idempotent) |
-| `DELETE FROM (TAG t \| [GROUP] g) [WHERE expr] [LIMIT 1]` | removes the matching elements (the container survives) |
+| `SELECT ROOT [FOREACH ...\|OUTPUT ...]` | prints every element in the document, any tag |
+| `UPDATE (TAG t \| ROOT \| [GROUP] g) SET a = e, ... [WHERE expr] [LIMIT 1]` | MySQL-style sugar for a FOREACH: guard, then the SETs; `LIMIT 1` = BREAK after the first match |
+| `MERGE (TAG t \| ROOT \| [GROUP] g) SET a = e, ... [WHERE expr] [LIMIT 1]` | same, but attributes are written only where missing (idempotent) |
+| `DELETE FROM (TAG t \| ROOT \| [GROUP] g) [WHERE expr] [LIMIT 1]` | removes the matching elements (the container survives) |
 | `FOREACH v IN g <ops>` | iterates the group's direct children |
 | `FOREACH v IN TAG t <ops>` | iterates every element with tag `t` — document-wide at top level, within the current element's subtree when nested (zero nested matches iterate nothing) |
+| `FOREACH v IN ROOT <ops>` | iterates every element regardless of tag — document-wide at top level, within the current element's subtree when nested; for when the tag isn't known ahead of time |
 | `FOREACH v2 IN v <ops>` (nested) | iterates the current element's children (`v` = an enclosing loop variable) or a group found inside the current element; ops after a nested loop belong to it, and a `BREAK` inside it only ends the inner loop |
 | `WHERE <expr>` | guard: skips remaining ops for non-matching elements (a missing attribute participates as null) |
 | `WHERE REQUIRED attr <cond>` | like WHERE, but the attribute is mandatory: an element without it is a hard error (plain WHERE skips it silently) |
@@ -173,6 +190,7 @@ ANALYZE;                   print per-stage timings to stderr
 | `MERGE v.attr = <expr>` | writes the attribute only when missing; an existing value wins, even a different one (idempotent) |
 | `OUTPUT <expr> [AS name], ...` | emission point: prints a flat element with only the cited attributes/expressions, evaluated when execution reaches it (missing attributes are omitted; non-attribute expressions need `AS`); works in SELECT loops, plain FOREACH loops and nested loops (mixing scopes into one row) |
 | `OUTPUT *` | prints the whole current element — the implicit default of a SELECT loop without OUTPUT |
+| `OUTPUT COUNT(expr) \| MIN(expr) \| MAX(expr) \| SUM(expr) \| AVG(expr), ...` | aggregate: summarizes every element the loop reaches into one comma-joined line of plain numbers (no XML, no per-element rows). Must be the loop's only OUTPUT; `COUNT` counts non-null values, the rest ignore non-numeric/missing values; zero contributing rows reports `0` |
 | `DELETE [IGNORE] v.attr` | removes an attribute (`IGNORE`: no error if absent) |
 | `DELETE v` | removes the current element |
 | `BREAK` | stops the loop |
@@ -190,7 +208,11 @@ Settings (values `ON`/`OFF`, also `TRUE`/`FALSE`/`1`/`0`; names case-insensitive
 A *group* is the first element whose tag — or `name`/`id` attribute — equals
 the given name. A *tag* selector (`TAG t`) instead matches **all** elements
 whose tag equals `t` — attributes don't participate — at any depth; use it
-when the document has no reliable group structure. Group names may be identifiers (`arms`), numbers
+when the document has no reliable group structure. `ROOT` goes one step
+further: no tag filter at all, every element in the document (or, nested,
+every element in the current element's subtree) — use it when you don't
+know the tag name up front, e.g. a first exploratory pass over an unfamiliar
+file. Group names may be identifiers (`arms`), numbers
 (`SELECT GROUP 110000` — matches `<Group id="110000">`), or quoted strings
 (`SELECT GROUP "Group"` — for names that collide with keywords). Inside a loop, the loop variable, the group name and a bare
 attribute name all refer to the current element (`good.id`, `goods.id` and
@@ -203,6 +225,12 @@ attribute references. Values are dynamically typed — numeric semantics apply
 whenever both operands parse as numbers; `+` on non-numbers concatenates.
 Missing attributes compare as false (SQL-NULL-ish).
 
+Aggregate functions (`COUNT`, `MIN`, `MAX`, `SUM`, `AVG`) are only valid as a
+direct `OUTPUT` item — `OUTPUT COUNT(v.id)`, not `WHERE COUNT(v.id) > 0`.
+They replace the loop's usual one-row-per-element `OUTPUT` with a single
+line of comma-joined plain numbers, computed over every element the loop
+reaches (after `WHERE`).
+
 ## Performance
 
 - Hand-rolled single-pass lexer and recursive-descent parser; arena-based
@@ -210,8 +238,8 @@ Missing attributes compare as false (SQL-NULL-ish).
 - Rayon parallelism: documents load/parse in parallel, blocks for different
   documents execute in parallel, and large `FOREACH` loops (≥1024 children,
   no `BREAK`) evaluate expressions in parallel before applying mutations
-  sequentially — exact sequential semantics, parallel speed. TAG loops
-  parallelize only when no match is nested inside another.
+  sequentially — exact sequential semantics, parallel speed. TAG and ROOT
+  loops parallelize only when no match is nested inside another.
 - Output strings are pre-sized from the DOM (serializer and final output
   assembly), avoiding repeated reallocation on large documents.
 
@@ -225,3 +253,8 @@ Missing attributes compare as false (SQL-NULL-ish).
 
 - Preserve original formatting on output (attribute order is kept; comments
   are kept with `SET IGNORE_COMMENTS = OFF`; whitespace layout is not).
+- More aggregate functions: `FIRST`/`LAST` (first/last matching element's
+  value), `CONCAT`/`GROUP_CONCAT` (join values with a separator), a distinct
+  variant of `COUNT`. `GROUP BY`-style multi-row aggregation (one aggregate
+  row per distinct value of some attribute, instead of one row for the whole
+  loop) is a bigger, separate feature.

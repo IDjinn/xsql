@@ -136,6 +136,36 @@ impl Document {
         out
     }
 
+    /// Every element in the document, any tag, document order (depth-first).
+    /// Used by `ROOT`, for documents/subtrees whose tag names aren't known
+    /// ahead of time. Comment nodes are excluded.
+    pub fn all_elements(&self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = self.roots.iter().rev().copied().collect();
+        while let Some(id) = stack.pop() {
+            let el = self.node(id);
+            if !el.is_comment() {
+                out.push(id);
+            }
+            stack.extend(el.children.iter().rev());
+        }
+        out
+    }
+
+    /// Like [`Self::all_elements`], but searches only the descendants of `root`.
+    pub fn all_elements_within(&self, root: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = self.node(root).children.iter().rev().copied().collect();
+        while let Some(id) = stack.pop() {
+            let el = self.node(id);
+            if !el.is_comment() {
+                out.push(id);
+            }
+            stack.extend(el.children.iter().rev());
+        }
+        out
+    }
+
     /// Detaches `id` from its parent (or from the root list).
     pub fn detach(&mut self, id: NodeId) {
         match self.nodes[id].parent {
