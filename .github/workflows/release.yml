@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            artifact: xsql
+            asset: xsql-linux-x86_64
+          - os: macos-latest
+            triple: x86_64-apple-darwin
+            artifact: xsql
+            asset: xsql-macos-x86_64
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            artifact: xsql
+            asset: xsql-macos-arm64
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            artifact: xsql.exe
+            asset: xsql-windows-x86_64
+        simd: [false, true]
+
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (default)
+        if: ${{ !matrix.simd }}
+        run: cargo build --release --target ${{ matrix.target.triple }} -p xsql
+
+      - name: Build (simd)
+        if: ${{ matrix.simd }}
+        run: cargo build --release --target ${{ matrix.target.triple }} -p xsql --features simd
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          suffix="${{ matrix.simd == true && '-simd' || '' }}"
+          src="target/${{ matrix.target.triple }}/release/${{ matrix.target.artifact }}"
+          ext="${{ matrix.target.artifact }}"
+          if [[ "$ext" == *.exe ]]; then
+            out="dist/${{ matrix.target.asset }}${suffix}.exe"
+          else
+            out="dist/${{ matrix.target.asset }}${suffix}"
+          fi
+          cp "$src" "$out"
+          echo "asset_name=$(basename "$out")" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.asset_name }}
+          path: dist/${{ env.asset_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: false
+          generate_release_notes: true
