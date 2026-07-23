@@ -18,8 +18,22 @@ Usage:
 
 Options:
   -e, --eval <QUERY>   inline query
+  -i, --interactive    force interactive mode even with piped stdin
   -h, --help           show this help
   -V, --version        show version
+";
+
+const REPL_HELP: &str = "\
+REPL commands (bare or dot-prefixed, e.g. `COMMIT` or `.commit`):
+  .help                  show this help
+  .dump                  preview every modified document (stdout only)
+  BEGIN                  clear checkpoints (mutations are already implicit)
+  COMMIT                 write every modified document back to disk
+  ROLLBACK               discard changes back to the last COMMIT/load
+  ROLLBACK TO <name>     discard changes back to a named CHECKPOINT
+  CHECKPOINT <name>      snapshot every loaded document under <name>
+  SAVEPOINT <name>       alias for CHECKPOINT
+  exit | quit | .exit    leave the REPL (Ctrl+D also works)
 ";
 
 fn main() -> ExitCode {
@@ -27,6 +41,7 @@ fn main() -> ExitCode {
 
     let mut eval_query: Option<String> = None;
     let mut script_path: Option<String> = None;
+    let mut force_repl = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -38,6 +53,7 @@ fn main() -> ExitCode {
                 println!("xsql {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
+            "-i" | "--interactive" => force_repl = true,
             "-e" | "--eval" => match iter.next() {
                 Some(query) => eval_query = Some(query),
                 None => return usage_error("missing query after -e"),
@@ -69,8 +85,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-    } else if std::io::stdin().is_terminal() {
-        // No args and nothing piped in: interactive mode, like node/python.
+    } else if force_repl || std::io::stdin().is_terminal() {
+        // No args and nothing piped in (or -i forced it): interactive mode,
+        // like node/python.
         return repl();
     } else {
         script_from_stdin = true;
@@ -137,9 +154,45 @@ fn main() -> ExitCode {
     }
 }
 
+/// REPL-only transaction/meta commands, recognized as plain text (not
+/// through the lexer/parser) so they never collide with real xsql grammar —
+/// every real statement starts with `USE`.
+enum Meta {
+    Begin,
+    Commit,
+    Rollback(Option<String>),
+    Checkpoint(String),
+}
+
+/// Recognizes a bare SQL-style spelling (`COMMIT`) or a dot-prefixed
+/// spelling (`.commit`), case-insensitively. `None` means "not a
+/// meta-command, fall through to the normal xsql statement pipeline".
+/// `Some(Err(..))` means the keyword matched but its arguments didn't.
+fn parse_meta(line: &str) -> Option<std::result::Result<Meta, String>> {
+    let line = line.split(';').next().unwrap_or("").trim();
+    let mut words = line.split_whitespace();
+    let head = words.next()?.to_ascii_uppercase();
+    let head = head.trim_start_matches('.');
+    let rest: Vec<&str> = words.collect();
+    Some(Ok(match head {
+        "BEGIN" if rest.is_empty() => Meta::Begin,
+        "COMMIT" if rest.is_empty() => Meta::Commit,
+        "ROLLBACK" => match rest.as_slice() {
+            [] => Meta::Rollback(None),
+            [to, name] if to.eq_ignore_ascii_case("TO") => Meta::Rollback(Some((*name).to_string())),
+            _ => return Some(Err("usage: ROLLBACK  |  ROLLBACK TO <name>".into())),
+        },
+        "CHECKPOINT" | "SAVEPOINT" => match rest.as_slice() {
+            [name] => Meta::Checkpoint((*name).to_string()),
+            _ => return Some(Err("usage: CHECKPOINT <name>  (alias: SAVEPOINT)".into())),
+        },
+        _ => return None,
+    }))
+}
+
 fn repl() -> ExitCode {
     println!("xsql {} — interactive mode", env!("CARGO_PKG_VERSION"));
-    println!("End statements with `;`. Commands: .help  .dump (print modified docs)  exit");
+    println!("End statements with `;`. Commands: .help  .dump  BEGIN  COMMIT  ROLLBACK [TO name]  CHECKPOINT name (alias SAVEPOINT)  exit");
 
     let mut session = eval::Session::new(None);
     let mut current: Option<Source> = None;
@@ -165,7 +218,7 @@ fn repl() -> ExitCode {
                 "" => continue,
                 "exit" | "quit" | ".exit" => break,
                 ".help" => {
-                    print!("{USAGE}");
+                    print!("{REPL_HELP}");
                     continue;
                 }
                 ".dump" => {
@@ -176,7 +229,54 @@ fn repl() -> ExitCode {
                     }
                     continue;
                 }
-                _ => {}
+                other => match parse_meta(other) {
+                    Some(Ok(Meta::Begin)) => {
+                        let n = session.begin();
+                        println!("BEGIN (cleared {n} checkpoint(s))");
+                        continue;
+                    }
+                    Some(Ok(Meta::Commit)) => {
+                        let report = session.commit();
+                        if report.outcomes.is_empty() {
+                            println!("(nothing to commit)");
+                        } else {
+                            for (source, outcome) in &report.outcomes {
+                                match outcome {
+                                    eval::CommitOutcome::Saved(path) => println!("committed -> {path}"),
+                                    eval::CommitOutcome::PrintedToStdout(_) => {
+                                        println!("committed {} (no file; printed below)", source.describe())
+                                    }
+                                    eval::CommitOutcome::Failed(e) => {
+                                        eprintln!("error committing {}: {e}", source.describe())
+                                    }
+                                }
+                            }
+                            print!("{}", report.stdout_text);
+                        }
+                        continue;
+                    }
+                    Some(Ok(Meta::Rollback(to))) => {
+                        match session.rollback(to.as_deref()) {
+                            Ok(sources) if sources.is_empty() => println!("(nothing to roll back)"),
+                            Ok(sources) => println!(
+                                "rolled back: {}",
+                                sources.iter().map(Source::describe).collect::<Vec<_>>().join(", ")
+                            ),
+                            Err(e) => eprintln!("error: {e}"),
+                        }
+                        continue;
+                    }
+                    Some(Ok(Meta::Checkpoint(name))) => {
+                        let n = session.checkpoint(&name);
+                        println!("CHECKPOINT '{name}' created ({n} document(s))");
+                        continue;
+                    }
+                    Some(Err(msg)) => {
+                        eprintln!("error: {msg}");
+                        continue;
+                    }
+                    None => {}
+                },
             }
         }
 
@@ -201,6 +301,9 @@ fn repl() -> ExitCode {
     // Leaving the REPL: emit any pending edits so `xsql > out.xml` still works.
     if session.has_modifications() {
         print!("{}", session.dump_modified());
+        eprintln!(
+            "warning: uncommitted changes were not saved to disk (use COMMIT before exiting to persist them)"
+        );
     }
     ExitCode::SUCCESS
 }

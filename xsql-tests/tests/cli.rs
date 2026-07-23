@@ -162,3 +162,116 @@ FOREACH office IN office
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Sets up a fresh temp dir containing `db.xml` with one mutable attribute,
+/// for the REPL/transaction tests below. Caller must `std::fs::remove_dir_all` it.
+fn repl_fixture_dir(test_name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("xsql-repl-test-{test_name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("db.xml"), r#"<db><arms><ItemSpec id="1" cost="5"/></arms></db>"#).unwrap();
+    dir
+}
+
+#[test]
+fn repl_commit_saves_to_disk() {
+    let dir = repl_fixture_dir("commit-saves");
+    let script = "USE db.xml\nFOREACH a IN arms SET a.cost = 99;\nCOMMIT;\nexit\n";
+    let out = run_xsql(&["-i"], Some(script), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("committed -> db.xml"), "{}", out.stdout);
+
+    let on_disk = std::fs::read_to_string(dir.join("db.xml")).unwrap();
+    assert!(on_disk.contains(r#"cost="99""#), "{on_disk}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repl_without_commit_leaves_file_untouched() {
+    let dir = repl_fixture_dir("no-commit");
+    let original = std::fs::read_to_string(dir.join("db.xml")).unwrap();
+    let script = "USE db.xml\nFOREACH a IN arms SET a.cost = 99;\nexit\n";
+    let out = run_xsql(&["-i"], Some(script), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains(r#"cost="99""#), "{}", out.stdout);
+    assert!(out.stderr.contains("uncommitted changes were not saved to disk"), "{}", out.stderr);
+
+    let on_disk = std::fs::read_to_string(dir.join("db.xml")).unwrap();
+    assert_eq!(on_disk, original, "file on disk should be untouched without COMMIT");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repl_rollback_discards_edits() {
+    let dir = repl_fixture_dir("rollback");
+    let script = "USE db.xml\nFOREACH a IN arms SET a.cost = 99;\nROLLBACK;\nSELECT GROUP arms;\n.dump\nexit\n";
+    let out = run_xsql(&["-i"], Some(script), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains(r#"cost="5""#), "{}", out.stdout);
+    assert!(!out.stdout.contains(r#"cost="99""#), "{}", out.stdout);
+    assert!(out.stdout.contains("(no modified documents)"), "{}", out.stdout);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repl_checkpoint_and_rollback_to() {
+    let dir = repl_fixture_dir("checkpoint");
+    let script = "USE db.xml\nFOREACH a IN arms SET a.cost = 99;\nCHECKPOINT c1;\nFOREACH a IN arms SET a.cost = 150;\nROLLBACK TO c1;\nSELECT GROUP arms;\nexit\n";
+    let out = run_xsql(&["-i"], Some(script), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains(r#"cost="99""#), "{}", out.stdout);
+    assert!(!out.stdout.contains(r#"cost="150""#), "{}", out.stdout);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repl_rollback_to_unknown_checkpoint_errors() {
+    let dir = repl_fixture_dir("unknown-checkpoint");
+    let script = "ROLLBACK TO nope;\nUSE db.xml\nSELECT GROUP arms;\nexit\n";
+    let out = run_xsql(&["-i"], Some(script), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("no checkpoint named `nope`"), "{}", out.stderr);
+    assert!(out.stdout.contains(r#"cost="5""#), "REPL should keep working after the error: {}", out.stdout);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Regression test for `exec` atomicity: a FOREACH loop over two children
+/// where the first child's mutation is planned+applied and the second
+/// child's `WHERE REQUIRED` then hard-errors (missing attribute) must leave
+/// no trace of the first child's mutation once the whole `exec` call fails.
+#[test]
+fn repl_atomicity_partial_script_failure() {
+    let dir = repl_fixture_dir("atomicity");
+    std::fs::write(
+        dir.join("db.xml"),
+        r#"<db><arms><ItemSpec id="1" cost="5" flag="1"/><ItemSpec id="2" cost="5"/></arms></db>"#,
+    )
+    .unwrap();
+    let script = "USE db.xml\nFOREACH a IN arms SET a.cost = 99 WHERE REQUIRED a.flag > 0;\nSELECT GROUP arms;\nexit\n";
+    let out = run_xsql(&["-i"], Some(script), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("REQUIRED but missing"), "{}", out.stderr);
+    assert!(
+        !out.stdout.contains(r#"cost="99""#),
+        "first child's mutation should have been rolled back: {}",
+        out.stdout
+    );
+    assert!(out.stdout.contains(r#"id="1" cost="5""#), "{}", out.stdout);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repl_begin_clears_checkpoints() {
+    let dir = repl_fixture_dir("begin-clears");
+    let script = "USE db.xml\nSELECT GROUP arms;\nCHECKPOINT c1;\nBEGIN;\nROLLBACK TO c1;\nexit\n";
+    let out = run_xsql(&["-i"], Some(script), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("no checkpoint named `c1`"), "{}", out.stderr);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

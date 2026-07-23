@@ -268,13 +268,51 @@ fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
+/// A named savepoint: the document snapshot taken at CHECKPOINT time.
+struct Checkpoint {
+    name: String,
+    doc: Document,
+}
+
+/// Per-document REPL state: the live document plus enough history to support
+/// `COMMIT`/`ROLLBACK`/`CHECKPOINT`.
+struct DocEntry {
+    source: Source,
+    doc: Document,
+    /// Diverged from `baseline` since the last COMMIT/ROLLBACK.
+    dirty: bool,
+    /// Snapshot to restore on a bare `ROLLBACK`: `doc` as of the last COMMIT
+    /// (or BEGIN, or initial load).
+    baseline: Document,
+    /// Named savepoints from CHECKPOINT, oldest first.
+    checkpoints: Vec<Checkpoint>,
+}
+
+/// What happened to one document on `COMMIT`.
+pub enum CommitOutcome {
+    /// Written to this file path.
+    Saved(String),
+    /// No file to write (`Source::Input`); here's the serialized text.
+    PrintedToStdout(String),
+    /// `std::fs::write` failed; the document is left dirty/unchanged.
+    Failed(String),
+}
+
+pub struct CommitReport {
+    pub outcomes: Vec<(Source, CommitOutcome)>,
+    /// Concatenated serialized XML for every `Source::Input` doc committed
+    /// this call (nothing to write to disk, so it's returned to print).
+    pub stdout_text: String,
+}
+
 /// Incremental interpreter for the REPL: documents load lazily on first
 /// `USE` and stay in memory (with their pending mutations) across submitted
 /// statements. SELECT output is returned per `exec`; modified documents are
-/// only serialized on demand via [`Session::dump_modified`].
+/// only serialized on demand via [`Session::dump_modified`], or written to
+/// disk via [`Session::commit`].
 pub struct Session {
     stdin_xml: Option<String>,
-    docs: Vec<(Source, Document, bool)>,
+    docs: Vec<DocEntry>,
     /// Global settings; `SET`/`ANALYZE` statements persist across execs.
     settings: Settings,
 }
@@ -292,12 +330,36 @@ impl Session {
         for stmt in &script.settings {
             self.settings.apply(stmt);
         }
+        let mut snapshotted: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut snapshots: Vec<(usize, Document, bool)> = Vec::new();
+        let outcome = self.run_blocks(script, &mut snapshotted, &mut snapshots);
+        if outcome.is_err() {
+            for (idx, doc, dirty) in snapshots {
+                self.docs[idx].doc = doc;
+                self.docs[idx].dirty = dirty;
+            }
+        }
+        outcome
+    }
+
+    /// Runs every block in `script`, snapshotting each distinct document the
+    /// first time this call touches it (into `snapshots`) so `exec` can
+    /// restore everything atomically if a later block errors.
+    fn run_blocks(
+        &mut self,
+        script: &Script,
+        snapshotted: &mut std::collections::HashSet<usize>,
+        snapshots: &mut Vec<(usize, Document, bool)>,
+    ) -> Result<String> {
         let settings = self.settings;
         let total_start = Instant::now();
         let mut timings: Vec<(String, Duration)> = Vec::new();
         let mut out = String::new();
         for (block_idx, block) in script.blocks.iter().enumerate() {
             let (idx, load_times) = self.doc_index(&block.source)?;
+            if snapshotted.insert(idx) {
+                snapshots.push((idx, self.docs[idx].doc.clone(), self.docs[idx].dirty));
+            }
             if settings.analyze {
                 if let Some((read_time, parse_time)) = load_times {
                     if matches!(block.source, Source::File(_)) {
@@ -312,9 +374,9 @@ impl Session {
                     ));
                 }
             }
-            let (_, doc, modified) = &mut self.docs[idx];
+            let entry = &mut self.docs[idx];
             let start = Instant::now();
-            let result = run_block(doc, block, &settings)?;
+            let result = run_block(&mut entry.doc, block, &settings)?;
             if settings.analyze {
                 timings.push((
                     format!(
@@ -326,7 +388,7 @@ impl Session {
                     start.elapsed(),
                 ));
             }
-            *modified |= result.modified;
+            entry.dirty |= result.modified;
             if let Some(text) = result.output {
                 out.push_str(&text);
             }
@@ -334,7 +396,7 @@ impl Session {
         if settings.analyze && !script.blocks.is_empty() {
             let report = AnalyzeReport {
                 lines: timings,
-                memory_bytes: Some(self.docs.iter().map(|(_, doc, _)| doc.memory_bytes()).sum()),
+                memory_bytes: Some(self.docs.iter().map(|e| e.doc.memory_bytes()).sum()),
             };
             eprint!("{}", report.render(total_start.elapsed()));
         }
@@ -345,19 +407,121 @@ impl Session {
     pub fn dump_modified(&self) -> String {
         self.docs
             .iter()
-            .filter(|(_, _, modified)| *modified)
-            .map(|(_, doc, _)| serialize_document_opts(doc, self.settings.format))
+            .filter(|e| e.dirty)
+            .map(|e| serialize_document_opts(&e.doc, self.settings.format))
             .collect()
     }
 
     pub fn has_modifications(&self) -> bool {
-        self.docs.iter().any(|(_, _, modified)| *modified)
+        self.docs.iter().any(|e| e.dirty)
+    }
+
+    /// Writes every dirty document to disk (or, for `Source::Input`
+    /// documents with no file to write, appends its text to
+    /// [`CommitReport::stdout_text`]). On success a document's baseline is
+    /// reset to the just-written state and its checkpoints are cleared.
+    pub fn commit(&mut self) -> CommitReport {
+        let mut outcomes = Vec::new();
+        let mut stdout_text = String::new();
+        for entry in &mut self.docs {
+            if !entry.dirty {
+                continue;
+            }
+            let text = serialize_document_opts(&entry.doc, self.settings.format);
+            match &entry.source {
+                Source::File(path) => match std::fs::write(path, &text) {
+                    Ok(()) => {
+                        entry.baseline = entry.doc.clone();
+                        entry.checkpoints.clear();
+                        entry.dirty = false;
+                        outcomes.push((entry.source.clone(), CommitOutcome::Saved(path.clone())));
+                    }
+                    Err(e) => outcomes.push((entry.source.clone(), CommitOutcome::Failed(e.to_string()))),
+                },
+                Source::Input => {
+                    stdout_text.push_str(&text);
+                    entry.baseline = entry.doc.clone();
+                    entry.checkpoints.clear();
+                    entry.dirty = false;
+                    outcomes.push((entry.source.clone(), CommitOutcome::PrintedToStdout(text)));
+                }
+            }
+        }
+        CommitReport { outcomes, stdout_text }
+    }
+
+    /// `to = None`: restores every document to its last-COMMIT/load baseline
+    /// and drops all checkpoints. `to = Some(name)`: restores every document
+    /// that has a checkpoint named `name` to that snapshot, keeping it but
+    /// dropping any later checkpoints (SQL `ROLLBACK TO SAVEPOINT`
+    /// semantics). Returns the sources touched, or an error if `name` names
+    /// a checkpoint that exists on no loaded document.
+    pub fn rollback(&mut self, to: Option<&str>) -> std::result::Result<Vec<Source>, String> {
+        let mut touched = Vec::new();
+        match to {
+            None => {
+                for entry in &mut self.docs {
+                    if entry.dirty || !entry.checkpoints.is_empty() {
+                        entry.doc = entry.baseline.clone();
+                        entry.checkpoints.clear();
+                        entry.dirty = false;
+                        touched.push(entry.source.clone());
+                    }
+                }
+                Ok(touched)
+            }
+            Some(name) => {
+                let found_any = self
+                    .docs
+                    .iter()
+                    .any(|e| e.checkpoints.iter().any(|c| c.name == name));
+                if !found_any {
+                    return Err(format!("no checkpoint named `{name}`"));
+                }
+                for entry in &mut self.docs {
+                    if let Some(pos) = entry.checkpoints.iter().position(|c| c.name == name) {
+                        entry.doc = entry.checkpoints[pos].doc.clone();
+                        entry.checkpoints.truncate(pos + 1);
+                        entry.dirty = true;
+                        touched.push(entry.source.clone());
+                    }
+                }
+                Ok(touched)
+            }
+        }
+    }
+
+    /// Creates (or replaces) a named checkpoint on every loaded document.
+    /// Returns how many documents got one.
+    pub fn checkpoint(&mut self, name: &str) -> usize {
+        let mut count = 0;
+        for entry in &mut self.docs {
+            let snapshot = Checkpoint {
+                name: name.to_string(),
+                doc: entry.doc.clone(),
+            };
+            if let Some(existing) = entry.checkpoints.iter_mut().find(|c| c.name == name) {
+                *existing = snapshot;
+            } else {
+                entry.checkpoints.push(snapshot);
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// Clears every document's checkpoint stack (the session is always
+    /// implicitly "in a transaction", so BEGIN doesn't touch the rollback
+    /// baseline — it's just a "forget my savepoints" reset). Returns how
+    /// many checkpoints were discarded in total.
+    pub fn begin(&mut self) -> usize {
+        self.docs.iter_mut().map(|e| std::mem::take(&mut e.checkpoints).len()).sum()
     }
 
     /// Returns the document's index, plus (read, XML-parse) times when this
     /// call is the one that loaded it.
     fn doc_index(&mut self, source: &Source) -> Result<(usize, Option<(Duration, Duration)>)> {
-        if let Some(idx) = self.docs.iter().position(|(s, _, _)| s == source) {
+        if let Some(idx) = self.docs.iter().position(|e| &e.source == source) {
             return Ok((idx, None));
         }
         if *source == Source::Input && self.stdin_xml.is_none() {
@@ -373,7 +537,13 @@ impl Session {
         let doc = parse_document_opts(&content, !self.settings.ignore_comments)
             .map_err(|e| XsqlError::plain(format!("{name}: {e}")))?;
         let times = (read_time, parse_start.elapsed());
-        self.docs.push((source.clone(), doc, false));
+        self.docs.push(DocEntry {
+            source: source.clone(),
+            baseline: doc.clone(),
+            doc,
+            dirty: false,
+            checkpoints: Vec::new(),
+        });
         Ok((self.docs.len() - 1, Some(times)))
     }
 }
