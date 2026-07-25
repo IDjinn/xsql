@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["xsql", "xsql-tests", "xsql-bench"]
+# xsql-bench enables the `simd` feature; keeping it out of default builds
+# stops feature unification from silently building the xsql binary with the
+# permissive simd parser (build it explicitly with `-p xsql-bench`).
+default-members = ["xsql", "xsql-tests"]
 
 [profile.release]
 lto = true
