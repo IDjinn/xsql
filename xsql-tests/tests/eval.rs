@@ -562,8 +562,23 @@ fn update_tag_with_where() {
 fn delete_tag_removes_every_match() {
     let out = run_on_fixture("DELETE TAG ItemSpec;");
     assert!(!out.contains("<ItemSpec"), "{out}");
-    assert!(out.contains("<arms/>"), "{out}");
+    // arms was written `<arms>...</arms>` in the source; emptying it must
+    // not collapse it to `<arms/>` (empty elements keep their source form).
+    assert!(out.contains("<arms></arms>"), "{out}");
     assert!(out.contains("<OfficeSpec"), "{out}");
+}
+
+/// Emptied and untouched empty elements keep their source form after a real
+/// script run: `<x></x>` never collapses to `<x/>`, `<y/>` never expands.
+/// Regression test for .spd-style regex indexers that scan for `</Group>`.
+#[test]
+fn emptying_a_group_keeps_paired_close_tag() {
+    let xml = "<db><Group id=\"a\"><ItemSpec id=\"1\"/></Group><Group id=\"b\"></Group><Group id=\"c\"/></db>";
+    let script = parse("USE INPUT\nDELETE TAG ItemSpec;").unwrap();
+    let out = run(&script, Some(xml.to_string())).unwrap();
+    assert!(out.contains("<Group id=\"a\"></Group>"), "{out}");
+    assert!(out.contains("<Group id=\"b\"></Group>"), "{out}");
+    assert!(out.contains("<Group id=\"c\"/>"), "{out}");
 }
 
 #[test]

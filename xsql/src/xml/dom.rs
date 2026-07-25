@@ -18,6 +18,11 @@ pub struct Element {
     /// Concatenated text content directly inside this element.
     pub text: String,
     pub parent: Option<NodeId>,
+    /// Whether the source wrote this element as `<tag/>` rather than
+    /// `<tag></tag>`. Only consulted when the element serializes empty —
+    /// downstream consumers with naive scanners (regex-based indexers) can
+    /// depend on the distinction, so an empty element keeps its source form.
+    pub self_closing: bool,
 }
 
 impl Element {
@@ -208,6 +213,7 @@ impl Document {
             children: Vec::new(),
             text: src_el.text.clone(),
             parent: Some(parent),
+            self_closing: src_el.self_closing,
         });
         for &child in &src_el.children {
             let new_child = self.copy_rec(src, child, id);

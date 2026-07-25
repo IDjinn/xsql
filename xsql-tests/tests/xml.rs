@@ -15,6 +15,16 @@ fn round_trip_basic() {
     assert_eq!(serialize_document(&doc), src);
 }
 
+/// An empty element keeps its source form: `<x/>` stays self-closing,
+/// `<x></x>` keeps the explicit end tag. Downstream tools with regex-based
+/// scanners (e.g. .spd group indexers matching `</Group>`) rely on this.
+#[test]
+fn round_trip_preserves_empty_element_form() {
+    let src = "<db>\n    <Group id=\"empty\"></Group>\n    <Group id=\"leaf\"/>\n</db>\n";
+    let doc = parse_document(src).unwrap();
+    assert_eq!(serialize_document(&doc), src);
+}
+
 #[test]
 fn parses_text_and_escapes() {
     let doc = parse_document(r#"<a note="x &amp; y"><b>1 &lt; 2</b></a>"#).unwrap();

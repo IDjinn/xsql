@@ -126,7 +126,14 @@ fn serialize_node(
 
     let text = el.text.trim();
     if el.children.is_empty() && text.is_empty() {
-        out.push_str("/>");
+        // Keep the source's form: `<tag/>` vs `<tag></tag>`.
+        if el.self_closing {
+            out.push_str("/>");
+        } else {
+            out.push_str("></");
+            out.push_str(tag);
+            out.push('>');
+        }
         if pretty {
             out.push('\n');
         }

@@ -34,12 +34,13 @@ pub fn parse_document_diag(source: &str, keep_comments: bool) -> Result<Document
         match reader.read_event() {
             Ok(Event::Decl(_)) => doc.had_decl = true,
             Ok(Event::Start(start)) => {
-                let id = open_element(&mut doc, &stack, &start)
+                let id = open_element(&mut doc, &stack, &start, false)
                     .map_err(|message| at(&reader, message))?;
                 stack.push(id);
             }
             Ok(Event::Empty(start)) => {
-                open_element(&mut doc, &stack, &start).map_err(|message| at(&reader, message))?;
+                open_element(&mut doc, &stack, &start, true)
+                    .map_err(|message| at(&reader, message))?;
             }
             Ok(Event::End(_)) => {
                 stack.pop();
@@ -67,6 +68,7 @@ pub fn parse_document_diag(source: &str, keep_comments: bool) -> Result<Document
                     children: Vec::new(),
                     text,
                     parent,
+                    self_closing: false,
                 });
                 match parent {
                     Some(p) => doc.node_mut(p).children.push(id),
@@ -119,6 +121,7 @@ fn open_element(
     doc: &mut Document,
     stack: &[NodeId],
     start: &BytesStart,
+    self_closing: bool,
 ) -> Result<NodeId, String> {
     let tag = String::from_utf8_lossy(start.name().as_ref()).into_owned();
     let mut attrs = Vec::new();
@@ -139,6 +142,7 @@ fn open_element(
         children: Vec::new(),
         text: String::new(),
         parent,
+        self_closing,
     });
     match parent {
         Some(p) => doc.node_mut(p).children.push(id),

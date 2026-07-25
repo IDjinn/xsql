@@ -59,6 +59,7 @@ pub fn parse_document_opts(source: &str, keep_comments: bool) -> Result<Document
                     children: Vec::new(),
                     text: String::new(),
                     parent,
+                    self_closing: matches!(index.tag_type(i), TagType::SelfClose),
                 });
                 attach(&mut doc, parent, id);
                 node_of[i] = Some(id);
@@ -79,6 +80,7 @@ pub fn parse_document_opts(source: &str, keep_comments: bool) -> Result<Document
                     children: Vec::new(),
                     text,
                     parent,
+                    self_closing: false,
                 });
                 attach(&mut doc, parent, id);
                 node_of[i] = Some(id);
