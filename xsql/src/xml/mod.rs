@@ -1,4 +1,5 @@
 pub mod dom;
+pub mod encoding;
 pub mod parse;
 #[cfg(feature = "simd")]
 pub mod parse_simd;

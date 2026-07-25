@@ -53,6 +53,9 @@ pub struct Document {
     /// Top-level elements in document order (normally a single root).
     pub roots: Vec<NodeId>,
     pub had_decl: bool,
+    /// Output encoding: the source file's detected encoding, unless
+    /// overridden by `-E/--encoding`. Defaults to BOM-less UTF-8.
+    pub encoding: super::encoding::XmlEncoding,
 }
 
 impl Document {

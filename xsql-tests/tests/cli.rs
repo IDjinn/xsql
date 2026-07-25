@@ -339,3 +339,172 @@ fn repl_begin_clears_checkpoints() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- encoding preservation / -E override ----------------------------------
+
+const REPL_MUTATE_COMMIT: &str = "USE db.xml\nFOREACH a IN arms SET a.cost = 99;\nCOMMIT;\nexit\n";
+
+fn encoding_fixture_dir(test_name: &str, db_bytes: &[u8]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("xsql-enc-test-{test_name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("db.xml"), db_bytes).unwrap();
+    dir
+}
+
+#[test]
+fn commit_preserves_utf8_bom() {
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<db><arms><ItemSpec id=\"1\" cost=\"5\" name=\"ação\"/></arms></db>".as_bytes(),
+    );
+    let dir = encoding_fixture_dir("utf8-bom", &bytes);
+    let out = run_xsql(&["-i"], Some(REPL_MUTATE_COMMIT), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let on_disk = std::fs::read(dir.join("db.xml")).unwrap();
+    assert_eq!(&on_disk[..3], &[0xEF, 0xBB, 0xBF], "BOM should be preserved");
+    let text = std::str::from_utf8(&on_disk[3..]).unwrap();
+    assert!(text.contains(r#"cost="99""#), "{text}");
+    assert!(text.contains("ação"), "accents must stay UTF-8: {text}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn commit_preserves_latin1() {
+    // "ação" in ISO-8859-1: e7 = ç, e3 = ã.
+    let mut bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n<db><arms><ItemSpec id=\"1\" cost=\"5\" name=\"a\xE7\xE3o\"/></arms></db>".to_vec();
+    bytes.push(b'\n');
+    let dir = encoding_fixture_dir("latin1", &bytes);
+    let out = run_xsql(&["-i"], Some(REPL_MUTATE_COMMIT), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let on_disk = std::fs::read(dir.join("db.xml")).unwrap();
+    assert!(
+        on_disk.windows(3).any(|w| w == b"a\xE7\xE3"),
+        "accents must stay single-byte latin1: {on_disk:?}"
+    );
+    // ISO-8859-1 is normalized to its WHATWG superset label.
+    assert!(
+        on_disk.windows(12).any(|w| w == b"windows-1252"),
+        "decl should carry the output encoding"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn encoding_flag_overrides_to_utf8() {
+    let bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n<db><arms><ItemSpec id=\"1\" cost=\"5\" name=\"a\xE7\xE3o\"/></arms></db>".to_vec();
+    let dir = encoding_fixture_dir("override-utf8", &bytes);
+    let out = run_xsql(&["-i", "-E", "utf-8"], Some(REPL_MUTATE_COMMIT), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let on_disk = std::fs::read(dir.join("db.xml")).unwrap();
+    let text = std::str::from_utf8(&on_disk).expect("file must now be valid UTF-8");
+    assert!(text.contains("ação"), "{text}");
+    assert!(text.contains(r#"encoding="utf-8""#), "{text}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn encoding_flag_overrides_to_utf16() {
+    let dir = encoding_fixture_dir(
+        "override-utf16",
+        br#"<db><arms><ItemSpec id="1" cost="5"/></arms></db>"#,
+    );
+    let out = run_xsql(&["-i", "-E", "utf-16"], Some(REPL_MUTATE_COMMIT), Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let on_disk = std::fs::read(dir.join("db.xml")).unwrap();
+    assert_eq!(&on_disk[..2], &[0xFF, 0xFE], "UTF-16LE BOM expected");
+    let units: Vec<u16> = on_disk[2..]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let text = String::from_utf16(&units).unwrap();
+    assert!(text.contains(r#"cost="99""#), "{text}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_reads_utf16_and_bom_files() {
+    let mut utf16 = vec![0xFF, 0xFE];
+    for unit in "<?xml version=\"1.0\" encoding=\"UTF-16\"?><db><a x=\"maçã\"/></db>".encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    let dir = encoding_fixture_dir("check-utf16", &utf16);
+    let out = run_xsql(&["-c", "db.xml"], None, Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("db.xml: OK"), "{}", out.stdout);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn output_flag_writes_exact_bytes() {
+    let bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n<db><arms><ItemSpec id=\"1\" cost=\"5\" name=\"a\xE7\xE3o\"/></arms></db>".to_vec();
+    let dir = encoding_fixture_dir("output-flag", &bytes);
+    std::fs::write(dir.join("script.xsql"), "USE db.xml\nFOREACH a IN arms SET a.cost = 99;\n").unwrap();
+
+    let out = run_xsql(&["script.xsql", "-o", "out.xml"], None, Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.is_empty(), "-o should silence stdout: {}", out.stdout);
+
+    let written = std::fs::read(dir.join("out.xml")).unwrap();
+    assert!(
+        written.windows(3).any(|w| w == b"a\xE7\xE3"),
+        "-o must write raw latin1 bytes: {written:?}"
+    );
+    assert!(written.windows(9).any(|w| w == br#"cost="99""#));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn output_flag_combines_with_encoding_override() {
+    let dir = encoding_fixture_dir(
+        "output-flag-utf16",
+        br#"<db><arms><ItemSpec id="1" cost="5"/></arms></db>"#,
+    );
+    std::fs::write(dir.join("script.xsql"), "USE db.xml\nFOREACH a IN arms SET a.cost = 99;\n").unwrap();
+
+    let out = run_xsql(&["script.xsql", "-o", "out.xml", "-E", "utf-16"], None, Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let written = std::fs::read(dir.join("out.xml")).unwrap();
+    assert_eq!(&written[..2], &[0xFF, 0xFE], "UTF-16LE BOM expected");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn output_flag_rejected_with_check_mode() {
+    let out = run_xsql(&["-c", "-o", "out.xml", "x.xml"], None, None);
+    assert_eq!(out.code, 2);
+    assert!(out.stderr.contains("mutually exclusive"), "{}", out.stderr);
+}
+
+#[test]
+fn stdout_dump_preserves_source_encoding_bytes() {
+    // Script mode prints the modified doc to stdout; a latin1 source doc
+    // must come out as latin1 bytes.
+    let bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n<db><arms><ItemSpec id=\"1\" cost=\"5\" name=\"a\xE7\xE3o\"/></arms></db>".to_vec();
+    let dir = encoding_fixture_dir("stdout-latin1", &bytes);
+    let script = "USE db.xml\nFOREACH a IN arms SET a.cost = 99;\n";
+    std::fs::write(dir.join("script.xsql"), script).unwrap();
+
+    let mut cmd = Command::new(xsql_bin());
+    cmd.arg("script.xsql").current_dir(&dir).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.stdout.windows(3).any(|w| w == b"a\xE7\xE3"),
+        "stdout should carry latin1 bytes: {:?}",
+        out.stdout
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -43,7 +43,9 @@ pub fn serialize_document(doc: &Document) -> String {
 pub fn serialize_document_opts(doc: &Document, pretty: bool) -> String {
     let mut out = String::with_capacity(estimate_document_len(doc));
     if doc.had_decl {
-        out.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+        out.push_str("<?xml version=\"1.0\" encoding=\"");
+        out.push_str(doc.encoding.decl_name());
+        out.push_str("\"?>\n");
     }
     for &root in &doc.roots {
         serialize_node(doc, root, 0, pretty, None, &mut out);

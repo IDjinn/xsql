@@ -24,11 +24,19 @@ Usage:
   <xml> | xsql -c               validate XML piped on stdin
 
 Options:
-  -e, --eval <QUERY>   inline query
-  -c, --check          validate XML well-formedness instead of running a script
-  -i, --interactive    force interactive mode even with piped stdin
-  -h, --help           show this help
-  -V, --version        show version
+  -e, --eval <QUERY>       inline query
+  -c, --check              validate XML well-formedness instead of running a script
+  -i, --interactive        force interactive mode even with piped stdin
+  -E, --encoding <ENC>     output encoding for emitted/saved documents
+                           (default: preserve each file's source encoding;
+                           e.g. utf-8, utf-8-bom, utf-16, windows-1252, latin1)
+  -o, --output <FILE>      write output to FILE instead of stdout (exact
+                           bytes — immune to shell redirection re-encoding)
+  -h, --help               show this help
+  -V, --version            show version
+
+Input encoding is detected automatically (BOM, UTF-16, or the XML
+declaration's encoding attribute).
 ";
 
 const REPL_HELP: &str = "\
@@ -51,6 +59,8 @@ fn main() -> ExitCode {
     let mut paths: Vec<String> = Vec::new();
     let mut force_repl = false;
     let mut check_mode = false;
+    let mut out_encoding: Option<xsql::xml::encoding::XmlEncoding> = None;
+    let mut output_path: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -68,6 +78,21 @@ fn main() -> ExitCode {
                 Some(query) => eval_query = Some(query),
                 None => return usage_error("missing query after -e"),
             },
+            "-o" | "--output" => match iter.next() {
+                Some(path) => output_path = Some(path),
+                None => return usage_error("missing file after -o"),
+            },
+            "-E" | "--encoding" => match iter.next() {
+                Some(label) => match xsql::xml::encoding::from_label(&label) {
+                    Some(enc) => out_encoding = Some(enc),
+                    None => {
+                        return usage_error(&format!(
+                            "unknown encoding `{label}` (try utf-8, utf-8-bom, utf-16, utf-16be, windows-1252, latin1, ...)"
+                        ));
+                    }
+                },
+                None => return usage_error("missing encoding name after -E"),
+            },
             _ if arg.starts_with('-') => {
                 return usage_error(&format!("unknown option `{arg}`"));
             }
@@ -79,7 +104,10 @@ fn main() -> ExitCode {
         if eval_query.is_some() {
             return usage_error("-c and -e are mutually exclusive");
         }
-        return check_xml(&paths);
+        if output_path.is_some() {
+            return usage_error("-c and -o are mutually exclusive");
+        }
+        return check_xml(&paths, out_encoding);
     }
 
     let script_path = match paths.len() {
@@ -96,7 +124,11 @@ fn main() -> ExitCode {
     let (source_name, source) = if let Some(query) = eval_query {
         ("<eval>".to_string(), query)
     } else if let Some(path) = script_path {
-        match std::fs::read_to_string(&path) {
+        // Scripts also go through encoding detection, so a BOM'd or UTF-16
+        // file (e.g. created by PowerShell redirection) still lexes.
+        match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|bytes| {
+            xsql::xml::encoding::decode(&bytes).map(|(text, _)| text)
+        }) {
             Ok(text) => (path, text),
             Err(e) => {
                 eprintln!("error: cannot read script `{path}`: {e}");
@@ -106,7 +138,10 @@ fn main() -> ExitCode {
     } else if force_repl || std::io::stdin().is_terminal() {
         // No args and nothing piped in (or -i forced it): interactive mode,
         // like node/python.
-        return repl();
+        if output_path.is_some() {
+            return usage_error("-o needs a script, an -e query, or a piped script");
+        }
+        return repl(out_encoding);
     } else {
         script_from_stdin = true;
         match read_stdin() {
@@ -143,8 +178,20 @@ fn main() -> ExitCode {
     let stdin_time = stdin_start.elapsed();
     let read_stdin_xml = stdin_xml.is_some();
 
-    match eval::run_with_report(&script, stdin_xml) {
+    match eval::run_with_options(&script, stdin_xml, out_encoding) {
         Ok((output, report)) => {
+            let write_output = |bytes: &[u8]| -> Result<&'static str, String> {
+                match &output_path {
+                    Some(path) => std::fs::write(path, bytes)
+                        .map(|()| "write output file")
+                        .map_err(|e| format!("cannot write `{path}`: {e}")),
+                    None => {
+                        let _ = std::io::stdout().write_all(bytes);
+                        let _ = std::io::stdout().flush();
+                        Ok("write stdout")
+                    }
+                }
+            };
             match report {
                 Some(mut report) => {
                     let mut pre = vec![
@@ -156,12 +203,22 @@ fn main() -> ExitCode {
                     }
                     report.prepend(pre);
                     let write_start = std::time::Instant::now();
-                    print!("{output}");
-                    let _ = std::io::stdout().flush();
-                    report.push("write stdout", write_start.elapsed());
+                    let label = match write_output(&output) {
+                        Ok(label) => label,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    report.push(label, write_start.elapsed());
                     eprint!("{}", report.render(total_start.elapsed()));
                 }
-                None => print!("{output}"),
+                None => {
+                    if let Err(e) = write_output(&output) {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
             }
             ExitCode::SUCCESS
         }
@@ -208,11 +265,12 @@ fn parse_meta(line: &str) -> Option<std::result::Result<Meta, String>> {
     }))
 }
 
-fn repl() -> ExitCode {
+fn repl(out_encoding: Option<xsql::xml::encoding::XmlEncoding>) -> ExitCode {
     println!("xsql {} — interactive mode", env!("CARGO_PKG_VERSION"));
     println!("End statements with `;`. Commands: .help  .dump  BEGIN  COMMIT  ROLLBACK [TO name]  CHECKPOINT name (alias SAVEPOINT)  exit");
 
     let mut session = eval::Session::new(None);
+    session.set_output_encoding(out_encoding);
     let mut current: Option<Source> = None;
     let mut buffer = String::new();
     let stdin = std::io::stdin();
@@ -342,16 +400,27 @@ fn statement_ready(buffer: &str) -> bool {
     }
 }
 
-fn read_stdin() -> std::io::Result<String> {
-    let mut text = String::new();
-    std::io::stdin().read_to_string(&mut text)?;
+/// Reads all of stdin and decodes it (BOM / UTF-16 / decl-aware), so piped
+/// scripts and XML survive shells that re-encode text streams.
+fn read_stdin() -> Result<String, String> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    let (text, _) = xsql::xml::encoding::decode(&bytes)?;
     Ok(text)
 }
 
 /// `-c/--check`: parse each file (or stdin) as XML and report whether it is
 /// well-formed. `<file>: OK` per valid input on stdout, diagnostics with
 /// source context on stderr; exit code 1 if any input is invalid.
-fn check_xml(paths: &[String]) -> ExitCode {
+fn check_xml(paths: &[String], enc_override: Option<xsql::xml::encoding::XmlEncoding>) -> ExitCode {
+    let decode = |bytes: &[u8]| -> Result<String, String> {
+        match enc_override {
+            Some(enc) => xsql::xml::encoding::decode_as(enc, bytes),
+            None => xsql::xml::encoding::decode(bytes).map(|(text, _)| text),
+        }
+    };
     if paths.is_empty() {
         if std::io::stdin().is_terminal() {
             return usage_error("-c needs at least one XML file (or XML piped on stdin)");
@@ -377,7 +446,10 @@ fn check_xml(paths: &[String]) -> ExitCode {
 
     let mut failed = false;
     for path in paths {
-        match std::fs::read_to_string(path) {
+        match std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| decode(&bytes))
+        {
             Ok(xml) => match parse_document_diag(&xml, false) {
                 Ok(_) => println!("{path}: OK"),
                 Err(e) => {

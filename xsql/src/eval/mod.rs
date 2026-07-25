@@ -32,6 +32,7 @@ use rayon::prelude::*;
 use crate::ast::{BinOp, Block, Expr, Foreach, LoopSource, Op, Script, Selector, Settings, Source, Verb};
 use crate::error::{Result, Span, XsqlError};
 use crate::xml::dom::{Document, Element, NodeId};
+use crate::xml::encoding::{self, XmlEncoding};
 #[cfg(not(feature = "simd"))]
 use crate::xml::parse::{parse_document_opts, parse_fragment_opts};
 #[cfg(feature = "simd")]
@@ -104,6 +105,18 @@ pub fn run_with_report(
     script: &Script,
     stdin_xml: Option<String>,
 ) -> Result<(String, Option<AnalyzeReport>)> {
+    let (bytes, report) = run_with_options(script, stdin_xml, None)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), report))
+}
+
+/// Like [`run_with_report`], but returns raw output bytes: each modified
+/// document is encoded in its own output encoding (its source encoding, or
+/// `out_encoding` when given, which also re-encodes SELECT output).
+pub fn run_with_options(
+    script: &Script,
+    stdin_xml: Option<String>,
+    out_encoding: Option<XmlEncoding>,
+) -> Result<(Vec<u8>, Option<AnalyzeReport>)> {
     let settings = Settings::resolve(&script.settings);
 
     // Distinct sources in first-use order.
@@ -127,13 +140,14 @@ pub fn run_with_report(
         .map(|source| {
             let mut lines = Vec::new();
             let read_start = Instant::now();
-            let (name, content) = read_source(source, stdin_xml.as_deref())?;
+            let (name, content, src_encoding) = read_source(source, stdin_xml.as_deref())?;
             if matches!(source, Source::File(_)) {
                 lines.push((format!("{:<10} {name}", "read"), read_start.elapsed()));
             }
             let parse_start = Instant::now();
-            let doc = parse_document_opts(&content, !settings.ignore_comments)
+            let mut doc = parse_document_opts(&content, !settings.ignore_comments)
                 .map_err(|e| XsqlError::plain(format!("{name}: {e}")))?;
+            doc.encoding = out_encoding.unwrap_or(src_encoding);
             lines.push((format!("{:<10} {name}", "parse xml"), parse_start.elapsed()));
             Ok((doc, lines))
         })
@@ -186,23 +200,41 @@ pub fn run_with_report(
 
     // 4. Serialize modified documents in parallel, first-use order.
     let serialize_start = Instant::now();
-    let serialized: Vec<String> = docs
+    let serialized: Vec<(String, XmlEncoding)> = docs
         .par_iter()
         .zip(&runs)
         .filter(|(_, run)| run.modified)
-        .map(|(doc, _)| serialize_document_opts(doc, settings.format))
+        .map(|(doc, _)| (serialize_document_opts(doc, settings.format), doc.encoding))
         .collect();
     let serialize_time = serialize_start.elapsed();
 
     let assemble_start = Instant::now();
     let capacity = selects.iter().map(|(_, text)| text.len()).sum::<usize>()
-        + serialized.iter().map(String::len).sum::<usize>();
-    let mut out = String::with_capacity(capacity);
-    for (_, text) in selects {
-        out.push_str(&text);
-    }
-    for text in serialized {
-        out.push_str(&text);
+        + serialized.iter().map(|(text, _)| text.len()).sum::<usize>();
+    let mut out: Vec<u8> = Vec::with_capacity(capacity);
+    match out_encoding {
+        // Explicit override: one encoding for the entire output stream,
+        // SELECT text included.
+        Some(enc) => {
+            let mut text = String::with_capacity(capacity);
+            for (_, t) in selects {
+                text.push_str(&t);
+            }
+            for (t, _) in &serialized {
+                text.push_str(t);
+            }
+            out = encoding::encode(&text, enc);
+        }
+        // Preserve mode: SELECT output is UTF-8, each document keeps its
+        // source encoding.
+        None => {
+            for (_, text) in selects {
+                out.extend_from_slice(text.as_bytes());
+            }
+            for (text, enc) in &serialized {
+                out.extend_from_slice(&encoding::encode(text, *enc));
+            }
+        }
     }
     let assemble_time = assemble_start.elapsed();
 
@@ -315,6 +347,8 @@ pub struct Session {
     docs: Vec<DocEntry>,
     /// Global settings; `SET`/`ANALYZE` statements persist across execs.
     settings: Settings,
+    /// `-E/--encoding` override; `None` preserves each file's own encoding.
+    out_encoding: Option<XmlEncoding>,
 }
 
 impl Session {
@@ -323,7 +357,15 @@ impl Session {
             stdin_xml,
             docs: Vec::new(),
             settings: Settings::default(),
+            out_encoding: None,
         }
+    }
+
+    /// Forces every document written by this session (COMMIT) into `enc`
+    /// instead of its source encoding. Applies to documents loaded after the
+    /// call, so set it before the first `exec`.
+    pub fn set_output_encoding(&mut self, enc: Option<XmlEncoding>) {
+        self.out_encoding = enc;
     }
 
     pub fn exec(&mut self, script: &Script) -> Result<String> {
@@ -429,7 +471,7 @@ impl Session {
             }
             let text = serialize_document_opts(&entry.doc, self.settings.format);
             match &entry.source {
-                Source::File(path) => match std::fs::write(path, &text) {
+                Source::File(path) => match std::fs::write(path, encoding::encode(&text, entry.doc.encoding)) {
                     Ok(()) => {
                         entry.baseline = entry.doc.clone();
                         entry.checkpoints.clear();
@@ -531,11 +573,12 @@ impl Session {
             ));
         }
         let read_start = Instant::now();
-        let (name, content) = read_source(source, self.stdin_xml.as_deref())?;
+        let (name, content, src_encoding) = read_source(source, self.stdin_xml.as_deref())?;
         let read_time = read_start.elapsed();
         let parse_start = Instant::now();
-        let doc = parse_document_opts(&content, !self.settings.ignore_comments)
+        let mut doc = parse_document_opts(&content, !self.settings.ignore_comments)
             .map_err(|e| XsqlError::plain(format!("{name}: {e}")))?;
+        doc.encoding = self.out_encoding.unwrap_or(src_encoding);
         let times = (read_time, parse_start.elapsed());
         self.docs.push(DocEntry {
             source: source.clone(),
@@ -548,16 +591,19 @@ impl Session {
     }
 }
 
-fn read_source(source: &Source, stdin_xml: Option<&str>) -> Result<(String, String)> {
+fn read_source(source: &Source, stdin_xml: Option<&str>) -> Result<(String, String, XmlEncoding)> {
     match source {
-        Source::File(path) => Ok((
-            path.clone(),
-            std::fs::read_to_string(path)
-                .map_err(|e| XsqlError::plain(format!("cannot read `{path}`: {e}")))?,
-        )),
+        Source::File(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| XsqlError::plain(format!("cannot read `{path}`: {e}")))?;
+            let (text, enc) = encoding::decode(&bytes)
+                .map_err(|e| XsqlError::plain(format!("cannot read `{path}`: {e}")))?;
+            Ok((path.clone(), text, enc))
+        }
         Source::Input => Ok((
             "<stdin>".to_string(),
             stdin_xml.expect("checked by caller").to_string(),
+            XmlEncoding::default(),
         )),
     }
 }
