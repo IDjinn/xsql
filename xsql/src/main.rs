@@ -30,8 +30,9 @@ Options:
   -E, --encoding <ENC>     output encoding for emitted/saved documents
                            (default: preserve each file's source encoding;
                            e.g. utf-8, utf-8-bom, utf-16, windows-1252, latin1)
-  -o, --output <FILE>      write output to FILE instead of stdout (exact
-                           bytes — immune to shell redirection re-encoding)
+  -o, --output <FILE>      write modified documents to FILE instead of stdout
+                           (exact bytes — immune to shell redirection
+                           re-encoding); SELECT results still print to stdout
   -h, --help               show this help
   -V, --version            show version
 
@@ -180,13 +181,20 @@ fn main() -> ExitCode {
 
     match eval::run_with_options(&script, stdin_xml, out_encoding) {
         Ok((output, report)) => {
-            let write_output = |bytes: &[u8]| -> Result<&'static str, String> {
+            let write_output = |out: &eval::RunOutput| -> Result<&'static str, String> {
+                // SELECT results are query output for the terminal; `-o`
+                // receives only the modified documents, so SELECT text can
+                // never corrupt the written XML.
+                if !out.selects.is_empty() {
+                    let _ = std::io::stdout().write_all(&out.selects);
+                    let _ = std::io::stdout().flush();
+                }
                 match &output_path {
-                    Some(path) => std::fs::write(path, bytes)
+                    Some(path) => std::fs::write(path, &out.documents)
                         .map(|()| "write output file")
                         .map_err(|e| format!("cannot write `{path}`: {e}")),
                     None => {
-                        let _ = std::io::stdout().write_all(bytes);
+                        let _ = std::io::stdout().write_all(&out.documents);
                         let _ = std::io::stdout().flush();
                         Ok("write stdout")
                     }

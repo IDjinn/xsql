@@ -481,6 +481,39 @@ fn output_flag_combines_with_encoding_override() {
 }
 
 #[test]
+fn output_flag_keeps_select_results_on_stdout() {
+    // A script mixing SELECT and mutations: `-o` must receive only the
+    // modified document — SELECT text prepended to the file corrupts it.
+    let dir = encoding_fixture_dir(
+        "output-flag-select",
+        br#"<db><arms><ItemSpec id="1" cost="5"/></arms></db>"#,
+    );
+    std::fs::write(
+        dir.join("script.xsql"),
+        "USE db.xml\nSELECT GROUP arms;\nFOREACH a IN arms SET a.cost = 99;\n",
+    )
+    .unwrap();
+
+    let out = run_xsql(&["script.xsql", "-o", "out.xml"], None, Some(&dir));
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.contains(r#"cost="5""#),
+        "SELECT results must still print to stdout: {}",
+        out.stdout
+    );
+
+    let written = std::fs::read_to_string(dir.join("out.xml")).unwrap();
+    assert!(
+        !written.contains(r#"cost="5""#),
+        "SELECT output leaked into the -o file: {written}"
+    );
+    assert_eq!(written.matches("<arms>").count(), 1, "document must appear exactly once: {written}");
+    assert!(written.contains(r#"cost="99""#), "{written}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn output_flag_rejected_with_check_mode() {
     let out = run_xsql(&["-c", "-o", "out.xml", "x.xml"], None, None);
     assert_eq!(out.code, 2);

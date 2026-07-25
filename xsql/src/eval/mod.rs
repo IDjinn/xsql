@@ -105,18 +105,31 @@ pub fn run_with_report(
     script: &Script,
     stdin_xml: Option<String>,
 ) -> Result<(String, Option<AnalyzeReport>)> {
-    let (bytes, report) = run_with_options(script, stdin_xml, None)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), report))
+    let (out, report) = run_with_options(script, stdin_xml, None)?;
+    let mut text = String::from_utf8_lossy(&out.selects).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.documents));
+    Ok((text, report))
 }
 
-/// Like [`run_with_report`], but returns raw output bytes: each modified
-/// document is encoded in its own output encoding (its source encoding, or
-/// `out_encoding` when given, which also re-encodes SELECT output).
+/// A script run's output, split so the two streams can go to different
+/// sinks: `-o` receives only the documents, keeping SELECT results from
+/// corrupting the written XML.
+pub struct RunOutput {
+    /// SELECT results in script order (UTF-8, unless `out_encoding`
+    /// re-encodes them).
+    pub selects: Vec<u8>,
+    /// Every modified document, each encoded in its own output encoding
+    /// (its source encoding, or `out_encoding` when given).
+    pub documents: Vec<u8>,
+}
+
+/// Like [`run_with_report`], but returns raw output bytes, SELECT results
+/// and modified documents separated (see [`RunOutput`]).
 pub fn run_with_options(
     script: &Script,
     stdin_xml: Option<String>,
     out_encoding: Option<XmlEncoding>,
-) -> Result<(Vec<u8>, Option<AnalyzeReport>)> {
+) -> Result<(RunOutput, Option<AnalyzeReport>)> {
     let settings = Settings::resolve(&script.settings);
 
     // Distinct sources in first-use order.
@@ -209,30 +222,36 @@ pub fn run_with_options(
     let serialize_time = serialize_start.elapsed();
 
     let assemble_start = Instant::now();
-    let capacity = selects.iter().map(|(_, text)| text.len()).sum::<usize>()
-        + serialized.iter().map(|(text, _)| text.len()).sum::<usize>();
-    let mut out: Vec<u8> = Vec::with_capacity(capacity);
+    let mut out = RunOutput { selects: Vec::new(), documents: Vec::new() };
     match out_encoding {
-        // Explicit override: one encoding for the entire output stream,
-        // SELECT text included.
+        // Explicit override: one encoding for both streams, SELECT text
+        // included. Each stream is encoded on its own so it carries its own
+        // BOM when the encoding has one.
         Some(enc) => {
-            let mut text = String::with_capacity(capacity);
+            let mut text = String::with_capacity(selects.iter().map(|(_, t)| t.len()).sum());
             for (_, t) in selects {
                 text.push_str(&t);
             }
+            if !text.is_empty() {
+                out.selects = encoding::encode(&text, enc);
+            }
+            let mut text =
+                String::with_capacity(serialized.iter().map(|(t, _)| t.len()).sum());
             for (t, _) in &serialized {
                 text.push_str(t);
             }
-            out = encoding::encode(&text, enc);
+            if !text.is_empty() {
+                out.documents = encoding::encode(&text, enc);
+            }
         }
         // Preserve mode: SELECT output is UTF-8, each document keeps its
         // source encoding.
         None => {
             for (_, text) in selects {
-                out.extend_from_slice(text.as_bytes());
+                out.selects.extend_from_slice(text.as_bytes());
             }
             for (text, enc) in &serialized {
-                out.extend_from_slice(&encoding::encode(text, *enc));
+                out.documents.extend_from_slice(&encoding::encode(text, *enc));
             }
         }
     }
