@@ -131,6 +131,70 @@ fn usage_error_exit_code() {
     assert_eq!(out.code, 2);
 }
 
+#[test]
+fn check_valid_file_reports_ok() {
+    let path = fixture_str();
+    let out = run_xsql(&["--check", &path], None, None);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains(&format!("{path}: OK")), "{}", out.stdout);
+}
+
+#[test]
+fn check_stdin_malformed_sets_exit_code() {
+    let out = run_xsql(&["-c"], Some("<db><arms></db>"), None);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("malformed XML"), "{}", out.stderr);
+}
+
+/// Diagnostics carry file:line:col plus the surrounding source lines and a
+/// caret under the failure column.
+#[test]
+fn check_error_shows_line_context() {
+    let xml = "<db>\n  <arms></arm>\n</db>";
+    let out = run_xsql(&["-c"], Some(xml), None);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("<stdin>:2:"), "{}", out.stderr);
+    assert!(out.stderr.contains(" 1 | <db>"), "{}", out.stderr);
+    assert!(out.stderr.contains(" 2 |   <arms></arm>"), "{}", out.stderr);
+    assert!(out.stderr.contains(" 3 | </db>"), "{}", out.stderr);
+    assert!(out.stderr.contains("^"), "{}", out.stderr);
+}
+
+#[test]
+fn check_stdin_unclosed_tag_is_rejected() {
+    let out = run_xsql(&["-c"], Some("<db><arms>"), None);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr.contains("never closed"), "{}", out.stderr);
+}
+
+#[test]
+fn check_stdin_valid_reports_ok() {
+    let out = run_xsql(&["-c"], Some(r#"<db><arms><ItemSpec id="7"/></arms></db>"#), None);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("<stdin>: OK"), "{}", out.stdout);
+}
+
+/// One bad file among good ones still fails, but good ones report OK.
+#[test]
+fn check_mixed_files_fails_but_reports_each() {
+    let dir = std::env::temp_dir().join(format!("xsql-check-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("bad.xml"), "<a><b></a>").unwrap();
+    let good = fixture_str();
+    let out = run_xsql(&["-c", &good, "bad.xml"], None, Some(&dir));
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(out.code, 1);
+    assert!(out.stdout.contains(&format!("{good}: OK")), "{}", out.stdout);
+    assert!(out.stderr.contains("bad.xml"), "{}", out.stderr);
+}
+
+#[test]
+fn check_and_eval_are_mutually_exclusive() {
+    let out = run_xsql(&["-c", "-e", "USE INPUT SELECT ROOT;"], None, None);
+    assert_eq!(out.code, 2);
+    assert!(out.stderr.contains("mutually exclusive"), "{}", out.stderr);
+}
+
 /// The original scratch-file script, run verbatim from a temp working dir
 /// containing `database.local.xml`.
 #[test]

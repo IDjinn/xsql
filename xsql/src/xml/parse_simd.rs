@@ -9,10 +9,24 @@ use std::collections::HashSet;
 use simdxml::XmlIndex;
 use simdxml::index::TagType;
 
+use super::XmlParseError;
 use super::dom::{COMMENT_TAG, Document, Element, NodeId};
 
 pub fn parse_document(source: &str) -> Result<Document, String> {
     parse_document_opts(source, false)
+}
+
+/// Like [`parse_document_opts`] but with the [`XmlParseError`] error type of
+/// the quick-xml path, so `xsql --check` compiles against either backend.
+/// simdxml errors carry no byte offset, so `byte` is always `None` here.
+pub fn parse_document_diag(source: &str, keep_comments: bool) -> Result<Document, XmlParseError> {
+    parse_document_opts(source, keep_comments).map_err(|message| XmlParseError {
+        message: message
+            .strip_prefix("malformed XML: ")
+            .map(str::to_owned)
+            .unwrap_or(message),
+        byte: None,
+    })
 }
 
 pub fn parse_document_opts(source: &str, keep_comments: bool) -> Result<Document, String> {

@@ -5,6 +5,11 @@ use xsql::ast::Source;
 use xsql::eval;
 use xsql::lexer::{Tok, lex};
 use xsql::parser;
+use xsql::xml::XmlParseError;
+#[cfg(not(feature = "simd"))]
+use xsql::xml::parse::parse_document_diag;
+#[cfg(feature = "simd")]
+use xsql::xml::parse_simd::parse_document_diag;
 
 const USAGE: &str = "\
 xsql - SQL-like language for querying and mutating XML files
@@ -13,11 +18,14 @@ Usage:
   xsql                          interactive mode (REPL)
   xsql <script.xsql>            run a script file
   xsql -e \"<query>\"             run an inline query
+  xsql -c <file.xml>...         validate that XML files are well-formed
   <producer> | xsql             read the script from stdin
   <xml> | xsql script.xsql      pipe an XML document to `USE INPUT`
+  <xml> | xsql -c               validate XML piped on stdin
 
 Options:
   -e, --eval <QUERY>   inline query
+  -c, --check          validate XML well-formedness instead of running a script
   -i, --interactive    force interactive mode even with piped stdin
   -h, --help           show this help
   -V, --version        show version
@@ -40,8 +48,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut eval_query: Option<String> = None;
-    let mut script_path: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
     let mut force_repl = false;
+    let mut check_mode = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -54,6 +63,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-i" | "--interactive" => force_repl = true,
+            "-c" | "--check" => check_mode = true,
             "-e" | "--eval" => match iter.next() {
                 Some(query) => eval_query = Some(query),
                 None => return usage_error("missing query after -e"),
@@ -61,14 +71,22 @@ fn main() -> ExitCode {
             _ if arg.starts_with('-') => {
                 return usage_error(&format!("unknown option `{arg}`"));
             }
-            _ => {
-                if script_path.is_some() {
-                    return usage_error("only one script file may be given");
-                }
-                script_path = Some(arg);
-            }
+            _ => paths.push(arg),
         }
     }
+
+    if check_mode {
+        if eval_query.is_some() {
+            return usage_error("-c and -e are mutually exclusive");
+        }
+        return check_xml(&paths);
+    }
+
+    let script_path = match paths.len() {
+        0 => None,
+        1 => Some(paths.remove(0)),
+        _ => return usage_error("only one script file may be given"),
+    };
 
     if eval_query.is_some() && script_path.is_some() {
         return usage_error("-e and a script file are mutually exclusive");
@@ -328,6 +346,125 @@ fn read_stdin() -> std::io::Result<String> {
     let mut text = String::new();
     std::io::stdin().read_to_string(&mut text)?;
     Ok(text)
+}
+
+/// `-c/--check`: parse each file (or stdin) as XML and report whether it is
+/// well-formed. `<file>: OK` per valid input on stdout, diagnostics with
+/// source context on stderr; exit code 1 if any input is invalid.
+fn check_xml(paths: &[String]) -> ExitCode {
+    if paths.is_empty() {
+        if std::io::stdin().is_terminal() {
+            return usage_error("-c needs at least one XML file (or XML piped on stdin)");
+        }
+        let xml = match read_stdin() {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("error: cannot read XML from stdin: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match parse_document_diag(&xml, false) {
+            Ok(_) => {
+                println!("<stdin>: OK");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprint!("{}", render_xml_error("<stdin>", &xml, &e));
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let mut failed = false;
+    for path in paths {
+        match std::fs::read_to_string(path) {
+            Ok(xml) => match parse_document_diag(&xml, false) {
+                Ok(_) => println!("{path}: OK"),
+                Err(e) => {
+                    failed = true;
+                    eprint!("{}", render_xml_error(path, &xml, &e));
+                }
+            },
+            Err(e) => {
+                failed = true;
+                eprintln!("error: cannot read `{path}`: {e}");
+            }
+        }
+    }
+    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+/// Max chars of a source line shown in `--check` diagnostics; minified XML
+/// can put the whole document on one line.
+const CHECK_CONTEXT_WIDTH: usize = 120;
+
+/// `file:line:col` diagnostic with the offending line plus one line of
+/// context on each side, caret under the failure column:
+///
+/// ```text
+/// error: db.xml:12:8: malformed XML: mismatched end tag
+///   11 |   <arms>
+///   12 |     <Item></arm>
+///      |        ^
+///   13 |   </arms>
+/// ```
+fn render_xml_error(name: &str, source: &str, err: &XmlParseError) -> String {
+    let Some((line, col)) = err.line_col(source) else {
+        return format!("error: {name}: malformed XML: {}\n", err.message);
+    };
+    let mut out = format!("error: {name}:{line}:{col}: malformed XML: {}\n", err.message);
+
+    let lines: Vec<&str> = source.lines().collect();
+    let first = line.saturating_sub(1).max(1);
+    let last = (line + 1).min(lines.len().max(line));
+    let width = last.to_string().len();
+    for n in first..=last {
+        let text = lines.get(n - 1).copied().unwrap_or("");
+        if n == line {
+            let (clipped, caret) = clip_around(text, col, CHECK_CONTEXT_WIDTH);
+            out.push_str(&format!(" {n:>width$} | {clipped}\n"));
+            out.push_str(&format!(" {:>width$} | {}^\n", "", " ".repeat(caret)));
+        } else {
+            let (clipped, _) = clip_around(text, 1, CHECK_CONTEXT_WIDTH);
+            out.push_str(&format!(" {n:>width$} | {clipped}\n"));
+        }
+    }
+    out
+}
+
+/// Clips `line` to a window of at most `width` bytes centered on 1-based
+/// byte column `col`, with `…` marking trimmed ends. Returns the display
+/// string and the 0-based char offset for the caret within it.
+fn clip_around(line: &str, col: usize, width: usize) -> (String, usize) {
+    if line.len() <= width {
+        let caret = line
+            .char_indices()
+            .take_while(|(i, _)| *i < col.saturating_sub(1))
+            .count();
+        return (line.to_string(), caret.min(line.chars().count()));
+    }
+    let target = (col - 1).min(line.len());
+    let mut start = target.saturating_sub(width / 2);
+    let mut end = (start + width).min(line.len());
+    while start > 0 && !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < line.len() && !line.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut display = String::new();
+    if start > 0 {
+        display.push('…');
+    }
+    display.push_str(&line[start..end]);
+    if end < line.len() {
+        display.push('…');
+    }
+    let caret = (start > 0) as usize
+        + line[start..target.max(start)]
+            .chars()
+            .count();
+    (display, caret)
 }
 
 fn usage_error(message: &str) -> ExitCode {

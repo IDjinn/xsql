@@ -6,6 +6,7 @@
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
+use super::XmlParseError;
 use super::dom::{COMMENT_TAG, Document, Element, NodeId};
 
 pub fn parse_document(source: &str) -> Result<Document, String> {
@@ -13,8 +14,18 @@ pub fn parse_document(source: &str) -> Result<Document, String> {
 }
 
 pub fn parse_document_opts(source: &str, keep_comments: bool) -> Result<Document, String> {
+    parse_document_diag(source, keep_comments).map_err(|e| e.describe(source))
+}
+
+/// Like [`parse_document_opts`] but keeps the failure position structured
+/// instead of formatting it into the message (used by `xsql --check` to
+/// render source context).
+pub fn parse_document_diag(source: &str, keep_comments: bool) -> Result<Document, XmlParseError> {
     let mut reader = Reader::from_str(source);
     reader.config_mut().trim_text(true);
+    // Reject `<a></b>`: without this quick-xml pairs any end tag with the
+    // innermost open element, silently producing a garbage DOM.
+    reader.config_mut().check_end_names = true;
 
     let mut doc = Document::default();
     let mut stack: Vec<NodeId> = Vec::new();
@@ -23,18 +34,21 @@ pub fn parse_document_opts(source: &str, keep_comments: bool) -> Result<Document
         match reader.read_event() {
             Ok(Event::Decl(_)) => doc.had_decl = true,
             Ok(Event::Start(start)) => {
-                let id = open_element(&mut doc, &stack, &start)?;
+                let id = open_element(&mut doc, &stack, &start)
+                    .map_err(|message| at(&reader, message))?;
                 stack.push(id);
             }
             Ok(Event::Empty(start)) => {
-                open_element(&mut doc, &stack, &start)?;
+                open_element(&mut doc, &stack, &start).map_err(|message| at(&reader, message))?;
             }
             Ok(Event::End(_)) => {
                 stack.pop();
             }
             Ok(Event::Text(text)) => {
                 if let Some(&id) = stack.last() {
-                    let value = text.unescape().map_err(|e| e.to_string())?;
+                    let value = text
+                        .unescape()
+                        .map_err(|e| at(&reader, e.to_string()))?;
                     doc.node_mut(id).text.push_str(&value);
                 }
             }
@@ -60,17 +74,35 @@ pub fn parse_document_opts(source: &str, keep_comments: bool) -> Result<Document
                 }
             }
             Ok(Event::Comment(_) | Event::PI(_) | Event::DocType(_)) => {}
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                if let Some(&id) = stack.last() {
+                    return Err(XmlParseError {
+                        message: format!(
+                            "unexpected end of file, `<{}>` is never closed",
+                            doc.node(id).tag
+                        ),
+                        byte: Some(source.len()),
+                    });
+                }
+                break;
+            }
             Err(e) => {
-                return Err(format!(
-                    "malformed XML at byte {}: {e}",
-                    reader.buffer_position()
-                ));
+                return Err(XmlParseError {
+                    message: e.to_string(),
+                    byte: Some(reader.error_position() as usize),
+                });
             }
         }
     }
 
     Ok(doc)
+}
+
+fn at(reader: &Reader<&[u8]>, message: String) -> XmlParseError {
+    XmlParseError {
+        message,
+        byte: Some(reader.buffer_position() as usize),
+    }
 }
 
 /// Parses an XML fragment (zero or more sibling elements) into a standalone
